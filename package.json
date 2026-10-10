@@ -1,0 +1,54 @@
+{
+  "name": "dsh-webhook-dispatcher",
+  "version": "0.1.0",
+  "description": "Inbound webhook dispatch for dsh: endpoint routes on the framework main webServer admit deliveries (method gate, token auth, body budget, per-endpoint queue and concurrency) and spawn contained trigger sessions",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib/",
+    "src/",
+    "test/",
+    "skill/",
+    "README.md",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/ test/",
+    "selftest": "node test/selftest.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "~0.2.0-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "~0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "~0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox-policy": "~0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "~0.2.0-rc.2",
+    "@deepseek-ai/dsh-skill": "~0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "~0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "~0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "yaml": "^2.4.2"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "@typescript-eslint/eslint-plugin": "^8.70.1",
+    "@typescript-eslint/parser": "^8.70.1",
+    "eslint": "^10.11.0",
+    "typescript": "^5.9.3"
+  }
+}

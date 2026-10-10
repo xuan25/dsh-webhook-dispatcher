@@ -1,0 +1,10 @@
+# dsh-webhook-dispatcher bundle patch: the plugin row for the web profile.
+# The declared baseline config is the zero-endpoint shape (no routes
+# registered; the framework server keeps serving the GUI regardless).
+# Real endpoint rows are delivered through the profile/user cordis.patch.yml
+# config layer targeting this plugin's id.
+- insert:
+    - id: dsh-webhook-dispatcher
+      name: 'dsh-webhook-dispatcher'
+      config:
+        endpoints: []
