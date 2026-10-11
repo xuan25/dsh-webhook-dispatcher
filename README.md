@@ -6,8 +6,10 @@ session handles the delivered content. External systems such as CI pipelines,
 issue trackers, or monitoring tools can drive dsh sessions directly - no
 per-service bridge code.
 
-- Endpoints are exact routes on the framework's main webServer (the Web GUI
-  server); external reachability is the operator's reverse-proxy decision
+- Endpoints are exact routes on the profile's webServer service (the Web GUI
+  server in the web profile; other profiles compose
+  @deepseek-ai/dsh-host-webserver - see Cross-profile deployment); external
+  reachability is the operator's reverse-proxy decision
 - Per-endpoint configuration: identity (id / path / name), token auth, policy
   text, working directory, sandbox, model, and resource limits
 - Each admitted delivery spawns a fresh agent session; per-endpoint
@@ -25,8 +27,26 @@ dsh plugin --profile <name> add dsh-webhook-dispatcher
 ```
 
 Configure endpoints through the `DSH_WEBHOOK_*` env block and/or the cordis
-config layer (see Configuration); reachability from outside the host is the
-operator's reverse-proxy decision.
+config layer (see Configuration).
+
+## Cross-profile deployment
+
+Endpoints register as exact routes on the profile's `webServer` service. The
+`web` profile provides it through the Web GUI server; every other profile
+(`sdk`, `acp`, a custom bundle) must compose a `webServer` provider into its
+own composition - `@deepseek-ai/dsh-host-webserver` is the framework's HTTP
+route server (a bare `node:http` listener without the Web UI; see its own
+docs). One-shot surfaces (`headless`) are not a fit (no resident listener):
+
+```yaml
+# $DSH_HOME/profiles/<name>/cordis.patch.yml (example: the sdk profile)
+- insert:
+    - id: webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      config:
+        host: 127.0.0.1
+        port: <port>  # a free fixed port; port 0 re-rolls the callback address on every restart
+```
 
 ## Configuration
 
@@ -47,7 +67,7 @@ layer > env > built-in defaults.
         path: /<path>
         policy: "Treat the content as a task description and act on it."
         # name: <name>           (default: the id)
-        # cwd: /workspace        (default: $DSH_HOME/dsh-webhook-dispatcher)
+        # cwd: /abs/path         (default: $DSH_HOME/dsh-webhook-dispatcher)
         # auth: <TOKEN_ENV>           (env var NAME holding the token value; empty = open endpoint)
         # sandbox: workspace-write    (read-only | workspace-write | danger-full-access)
         # model: some/model           (default: the default selection ladder)
@@ -56,9 +76,8 @@ layer > env > built-in defaults.
         # maxBodyBytes: 262144        (default)
 ```
 
-Unknown keys are rejected; `path` must not collide with a framework-owned
-route; a declared `auth` env name that is not set (or empty) fails the
-plugin at boot (fail-closed).
+Unknown keys are rejected (a typo guard); `path` must not collide with a
+framework-owned route.
 
 ### Env contract
 
@@ -115,4 +134,5 @@ Peer resolution is a deliberate dev/staged pair: the dev tree keeps
 `autoInstallPeers: true` so the peer closure resolves from the package's own
 `node_modules` (needed for the in-tree typecheck); the staged deployment tree
 ships `autoInstallPeers: false` plus `.npmrc legacy-peer-deps=true`, so peers
-resolve from the `/plugins` parent image like every neighbor plugin.
+resolve from the enclosing plugin tree of the deployment, like every
+neighbor plugin.

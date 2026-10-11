@@ -1485,16 +1485,16 @@ await okA('plugin: a dropped endpoint logs one line with its stale counts on rec
 
 // selftest hygiene guard
 {
-  // The shipped tree is self-contained and decoupled from any design document:
-  // the same pattern set applies to the test source (everything above this
-  // marker), every shipped source file, and the shipped skill/README (no
-  // doc pointers, no machine-specific paths, no line pointers, no
-  // review-round or version-round tags, no review-finding identifiers, no
-  // calendar dates, no CJK). A reader needs only this package plus stable
-  // external authorities. This guard block is excluded from its own scan.
+  // The shipped tree is self-contained and decoupled from any design
+  // document: the same pattern set applies to the test source (everything
+  // above this marker), every shipped source file, and the shipped
+  // skill/README. A reader needs only this package plus stable external
+  // authorities. This guard block is excluded from its own scan. The set
+  // is FROZEN: closed token families only; open-class failures belong to
+  // the review layer, not new patterns (2026-10-11 policy; details in the
+  // dsh_webhook entity file).
   const patterns = [
     ['design-doc section pointers', /design doc|design v\d|\u00a7\d/],
-    ['machine-specific paths', /\/workspace\//],
     ['source line-number pointers', /L\d+[-\u2013\u2014]L?\d+/],
     ['review-round wrappers', /round-?\d+|review #\d/],
     ['project version-round tags', /\bv\d{2}\b/],
@@ -1502,6 +1502,14 @@ await okA('plugin: a dropped endpoint logs one line with its stale counts on rec
     ['version-round identifiers', /\bv\d{2}[A-Za-z_]\w*/],
     ['calendar dates', /20\d{2}-\d{2}-\d{2}/],
     ['CJK characters', /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/],
+  ]
+  // Skill files ship into any profile's agent context: they must be
+  // deployment-agnostic (no literal host:port addresses - the curl recipes
+  // use the <host>:<port> placeholder, derived from the webhook status
+  // ingress block). Applied to skill/ files only (the README may show
+  // concrete example values in configuration snippets).
+  const skillOnlyPatterns = [
+    ['literal host:port addresses', /(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])/],
   ]
   const raw = readFileSync(path.join(root, 'test', 'selftest.mjs'), 'utf8')
   const sources = { 'test/selftest.mjs': raw.slice(0, raw.indexOf('// selftest hygiene guard')) }
@@ -1518,6 +1526,13 @@ await okA('plugin: a dropped endpoint logs one line with its stale counts on rec
       ok(`hygiene ${file}: no ${label}`, () => {
         if (re.test(code)) throw new Error(`pattern matched: ${re}`)
       })
+    }
+    if (file.startsWith('skill/')) {
+      for (const [label, re] of skillOnlyPatterns) {
+        ok(`hygiene ${file}: no ${label}`, () => {
+          if (re.test(code)) throw new Error(`pattern matched: ${re}`)
+        })
+      }
     }
   }
 }
