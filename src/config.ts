@@ -25,13 +25,14 @@ const ENDPOINT_FIELDS = {
   path: 'the exact route on the main webServer',
   name: 'the human-readable name (optional, non-empty; default: the id)',
   policy: 'the trigger-session policy block (empty: free-policy fallback)',
-  cwd: 'the trigger session working directory (absolute path, or empty for $DSH_HOME/dsh-webhook-dispatcher)',
+  cwd: 'the trigger session working directory (absolute path, or empty for the shared plugin workspace under $DSH_HOME/dsh-webhook-dispatcher)',
   auth: 'the env var NAME holding the expected X-Webhook-Token value (empty: open endpoint)',
   sandbox: `the trigger session sandbox mode (${SANDBOX_MODES.join(' | ')})`,
   model: 'the trigger session model (default: the default selection ladder)',
   maxConcurrent: 'max in-flight trigger sessions (default 1)',
   maxQueue: 'max queued deliveries (default 100)',
   maxBodyBytes: 'max request body bytes (default 262144)',
+  sessionRetention: 'the session retention window for automatic offload of settled trigger sessions (empty: no offload)',
 } as const
 
 /** The label of the per-endpoint schema in validation messages. */
@@ -95,6 +96,7 @@ export const ENDPOINT_CONFIG = rejectUnknownKeys(
     maxConcurrent: integerField(1, 1000, ENDPOINT_FIELDS.maxConcurrent),
     maxQueue: integerField(0, 100000, ENDPOINT_FIELDS.maxQueue),
     maxBodyBytes: integerField(1, 10485760, ENDPOINT_FIELDS.maxBodyBytes),
+    sessionRetention: Schema.string().description(ENDPOINT_FIELDS.sessionRetention),
   }),
   ENDPOINT_CONFIG_LABEL,
 )
@@ -149,10 +151,12 @@ export const CONFIG_FIELD_TO_ENV = {
   maxConcurrent: 'MAX_CONCURRENT',
   maxQueue: 'MAX_QUEUE',
   maxBodyBytes: 'MAX_BODY_BYTES',
+  sessionRetention: 'SESSION_RETENTION',
 } as const
 
 /** The recognized suffixes, longest first (the match is deterministic). */
 const ENV_FIELD_SUFFIXES: readonly string[] = [
+  'SESSION_RETENTION',
   'MAX_BODY_BYTES',
   'MAX_CONCURRENT',
   'MAX_QUEUE',
@@ -259,14 +263,18 @@ function parseEndpointEnv(env: Record<string, string | undefined>, warn: (msg: s
  * - `path` is inside the route charset and not in the framework deny-list,
  * - `id` and `path` are unique across both channels,
  * - a present `name` must be non-empty (the default when absent is the id),
- * - a present `cwd` must be absolute (empty = the shared plugin directory),
+ * - a present `cwd` must be absolute (empty = the shared plugin workspace),
  * - a present `sandbox` must be a declared mode,
  * - the integer fields must be in bounds,
  * - a non-empty `auth` env name must be set to a non-empty value in the
  *   process env (fail-closed): a declared token that cannot be read rejects
- *   the boot rather than silently opening the route.
- * An empty value of the other optional fields (policy / cwd / auth / model)
- * behaves as absent.
+ *   the boot rather than silently opening the route,
+ * - `sessionRetention` is a raw retention window string: the boot checks its
+ *   type only (any non-empty string passes), so an invalid window never
+ *   rejects the endpoint; the offload plane warns and treats the window as 0
+ *   (retain) when it loads.
+ * An empty value of the other optional fields (policy / cwd / auth / model /
+ * sessionRetention) behaves as absent.
  * @param raw the merged raw declarations (config layer over env).
  * @param env the process env: the auth presence check reads this record, not
  *   the merged one (a token value env can sit in the plugin namespace).
@@ -348,6 +356,8 @@ function buildEndpoints(raw: RawEndpoint[], env: Record<string, string | undefin
       }
       return n
     }
+    const sessionRetention =
+      f.SESSION_RETENTION !== undefined && f.SESSION_RETENTION !== '' ? f.SESSION_RETENTION : undefined
     const auth = f.AUTH ?? ''
     if (auth !== '') {
       const value = env[auth]
@@ -370,6 +380,7 @@ function buildEndpoints(raw: RawEndpoint[], env: Record<string, string | undefin
       maxConcurrent: int('maxConcurrent', 'MAX_CONCURRENT', 1, 1000, ENDPOINT_DEFAULTS.maxConcurrent),
       maxQueue: int('maxQueue', 'MAX_QUEUE', 0, 100000, ENDPOINT_DEFAULTS.maxQueue),
       maxBodyBytes: int('maxBodyBytes', 'MAX_BODY_BYTES', 1, 10485760, ENDPOINT_DEFAULTS.maxBodyBytes),
+      ...(sessionRetention !== undefined ? { sessionRetention } : {}),
     }
   })
   return { endpoints }

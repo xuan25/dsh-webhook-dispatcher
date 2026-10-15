@@ -23,7 +23,7 @@ export interface EndpointConfig {
   name: string
   /** Trigger-session policy block (empty: free-policy fallback). */
   policy: string
-  /** Trigger session working directory (default: $DSH_HOME/dsh-webhook-dispatcher). */
+  /** Trigger session working directory (default: the shared plugin workspace under $DSH_HOME/dsh-webhook-dispatcher). */
   cwd: string
   /** Env var NAME holding the expected X-Webhook-Token value (empty: open endpoint). */
   auth: string
@@ -37,6 +37,10 @@ export interface EndpointConfig {
   maxQueue: number
   /** Max request body bytes (default 262144). */
   maxBodyBytes: number
+  /** Session retention window for automatic offload of settled trigger
+   * sessions (absent or empty: no offload; the window grammar and the
+   * invalid-value behavior in the offload plane). */
+  sessionRetention?: string
 }
 
 /** One endpoint of the delivered config layer (before default application). */
@@ -52,6 +56,7 @@ export interface DeliveredEndpoint {
   maxConcurrent?: number
   maxQueue?: number
   maxBodyBytes?: number
+  sessionRetention?: string
 }
 
 /** The raw config layer delivered by the cordis loader (validated against the static Config schema). */

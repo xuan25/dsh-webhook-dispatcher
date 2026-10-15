@@ -1,6 +1,6 @@
 ---
 name: dsh-webhook-dispatcher
-description: "Inbound webhook dispatch for dsh: endpoint configuration reference (every field, default, and fail-closed rule), the HTTP contract (status codes, auth headers, Retry-After), the status verb, and the trigger-session semantics for webhook-spawned sessions."
+description: "Inbound webhook dispatch for dsh: endpoint configuration reference (every field, default, and fail-closed rule), the HTTP contract (status codes, auth headers, Retry-After), the status verb, the trigger-session semantics for webhook-spawned sessions, and the session offload knob (sessionRetention)."
 whenToUse: "When configuring or debugging dsh-webhook-dispatcher endpoints, interpreting the webhook status output, or acting as a webhook-triggered session."
 ---
 
@@ -34,6 +34,9 @@ prompt carries the delivery content.
 - The plugin performs no TLS and no identity verification beyond the
   per-endpoint token (ingress exposure and the trust boundary: see Security
   notes).
+- Session offload: a per-minute sweep archives settled trigger sessions that
+  outlived the endpoint's `sessionRetention` window, keeping the framework
+  session store bounded (see Session offload).
 
 ## Endpoint configuration reference
 
@@ -52,6 +55,7 @@ guard); a duplicate endpoint `id` or `path` fails startup loudly.
 | `name` | string | the `id` | human-readable label (rendered in the prompt L1 and the status view); a delivered value must be non-empty (the empty string is rejected at boot) |
 | `policy` | string | `""` | the trigger-session trust contract, appended verbatim to the prompt as the `Policy:` block (with it, the content is data: only policy-authorized actions are executed); empty = the free-policy fallback (the content - or its absence - is the task description; the session acts at its own judgment) |
 | `cwd` | string | `""` | the trigger-session working directory (a delivered value must be an absolute path; empty = `$DSH_HOME/dsh-webhook-dispatcher`, the shared plugin directory, created on demand). A missing/uncreatable workspace degrades to a workspace-less session (warning), never a delivery failure |
+| `sessionRetention` | string | `""` | the session offload window for this endpoint's trigger sessions: a non-negative integer number of milliseconds, or a duration string of 1-2 digits+unit segments (units `d`/`h`/`m`/`s`/`ms`) in descending order (e.g. `24h`, `4h30m`, `90s`, `5000ms`; a bare numeric string is invalid). `""`/`0` = retain in the store (never offloaded); an invalid value warns and counts as `0` (retain) - never a boot failure. Settled sessions whose window has elapsed are moved to the plugin's archive by the per-minute sweep; see Session offload |
 | `auth` | string | `""` | the ENV VAR NAME holding the expected token value (the value itself is read from the process env at request time; it is never stored or logged). Empty = open endpoint. A name that is unset or empty at startup fails startup fail-closed (no route registered, loud error naming the endpoint and the env name) |
 | `sandbox` | enum | absent | `read-only` \| `workspace-write` \| `danger-full-access`; applied to the trigger session via the per-session override (absent = the session default). The permission preset ids are 1:1 with these modes |
 | `model` | string | absent | the trigger-session model; overlays the model field of the deployment default selection ladder (agentDefaultModel service -> settings section -> `$DSH_HOME/settings.yaml`); absent = the ladder result (no route = the framework no-route rejection, surfaced as a failed session) |
@@ -76,6 +80,7 @@ declared one endpoint per id:
 | `maxConcurrent` | `MAX_CONCURRENT` |
 | `maxQueue` | `MAX_QUEUE` |
 | `maxBodyBytes` | `MAX_BODY_BYTES` |
+| `sessionRetention` | `SESSION_RETENTION` |
 
 - The id segment is the endpoint id uppercased with hyphens written as
   underscores (`ci-run` -> `DSH_WEBHOOK_CI_RUN_PATH`); the id charset carries
@@ -236,6 +241,62 @@ Session mechanics (for debugging, not for acting on):
 - `config`: the effective non-secret endpoint config (auth is the env NAME
   only - the token value is never rendered).
 
+## Session offload (sessionRetention)
+
+Webhook dispatches leave on-disk session logs in the framework session store
+(`$DSH_HOME/sessions`). The per-minute offload sweep (one instance per plugin
+process, independent of any delivery; the first round runs immediately at
+boot) bounds that store under the endpoints' `sessionRetention` windows:
+
+- **Write gate**: a dispatched trigger session is recorded in the retention
+  log (one line: session id, dispatch time, endpoint id, workspace) only
+  when its endpoint has a non-zero `sessionRetention` window at dispatch
+  time AND the session's workspace was prepared. An endpoint without a
+  window (absent, `0`, or invalid - the latter warns and counts as `0`),
+  and a session created without a workspace (a host without the
+  `dshHomePath` service, or an uncreatable `cwd`), are never recorded.
+- **Sweep**: every minute, each recorded session whose window has elapsed
+  (measured from dispatch time) or whose endpoint is gone from the
+  configuration (a removed endpoint is a vanished unit, offloaded
+  immediately regardless of age), and which is not live (not in-flight and
+  not in the live session registry), is moved from the session store into
+  the archive. The store is never deleted, only moved. A session still
+  running is kept and retried next round; if it goes live only after the
+  move, the move is reversed and the entry kept.
+- **Layout** (all under the harness home, `$DSH_HOME`): the plugin home
+  `$DSH_HOME/dsh-webhook-dispatcher/` holds the retention log
+  `retention-log.jsonl` (append-only lines; a ratio-triggered compaction
+  rewrites it atomically), the archive `archived-sessions/` (flat, keyed by
+  session id), and the default trigger-session workspace `workspace/`; the
+  framework session store root `$DSH_HOME/sessions` is a sibling of the
+  plugin home. Sessions without an endpoint `cwd` live under the shared
+  `workspace/` directory in the store; sessions with a `cwd` live under the
+  store root keyed by that path.
+- **Windows**: `sessionRetention` is per-endpoint (config layer: the
+  endpoint's `sessionRetention` field; env: `DSH_WEBHOOK_<ID>_SESSION_RETENTION`):
+  a non-negative integer number of milliseconds, or a duration string of
+  1-2 digits+unit segments (units `d`/`h`/`m`/`s`/`ms`) in descending order
+  (e.g. `24h`, `4h30m`, `90s`, `5000ms`; a bare numeric string is invalid).
+  `0` / absent = retain (no offload); an invalid value warns and is treated
+  as `0` (never a boot failure). A config-layer change re-constructs the
+  plugin (hot) with the new endpoint view: the new instance's sweep rounds
+  carry the new windows, to newly dispatched sessions and to sessions
+  already recorded in the retention log alike. The env channel is read once
+  at boot.
+- **Budget**: `DSH_WEBHOOK_OFFLOAD_BATCH` (env, default 50) bounds the
+  sessions one sweep may process; an invalid value warns and falls back to
+  50, never disabling the sweep. When consecutive sweeps observe new log
+  lines arriving faster than the budget, the sweep logs a trend warning
+  (raise the knob or lower the retention windows; the warning takes no
+  action on its own).
+
+If you are configuring an endpoint whose deliveries are frequent or chatty
+and the deployment should not accumulate trigger-session logs, set
+`sessionRetention` to the retention window the operator wants (e.g.
+`"24h"`). If you are a trigger session and your endpoint's window is set,
+your session directory will be moved to the archive after the window
+elapses; nothing else changes for you.
+
 ## curl recipes
 
 `<path>` = the endpoint's configured path; `<host>:<port>` = the address
@@ -304,3 +365,13 @@ resp=$(curl -s -o /dev/null -w '%{http_code}' http://<host>:<port>/<path> -H 'X-
 - A route never appears - startup validation rejected the endpoint (duplicate
   id/path, deny-list collision, or the auth env unset/empty); the plugin
   entry fails loudly at startup, nothing registers.
+- The session store keeps growing under a chatty endpoint - the endpoint has
+  no `sessionRetention` (or an invalid one: a warn, treated as `0`): set the
+  window. A repeated `trend alert` warn in the process log means new log
+  lines arrive faster than the offload budget: raise
+  `DSH_WEBHOOK_OFFLOAD_BATCH` or lower the windows.
+- A settled trigger session never leaves the store despite a
+  `sessionRetention` - either it was never recorded (the session was created
+  without a workspace: the host has no `dshHomePath` service, or workspace
+  preparation failed - check the warn in the process log), or its session
+  still settles as live (in-flight or in the live registry) every sweep.

@@ -15,7 +15,10 @@ per-service bridge code.
 - Each admitted delivery spawns a fresh agent session; per-endpoint
   concurrency and queue caps, with `429` + `Retry-After` backpressure
 - A single `webhook status` tool verb reports live routes, queue depth, and
-  recent delivery history; the plugin creates no config or state files
+  recent delivery history; the plugin creates no config files
+- Session offload: a per-minute sweep archives settled trigger sessions that
+  outlived the endpoint's `sessionRetention` window, keeping the framework
+  session store bounded
 
 ## Installation
 
@@ -74,6 +77,7 @@ layer > env > built-in defaults.
         # maxConcurrent: 1            (default)
         # maxQueue: 100               (default)
         # maxBodyBytes: 262144        (default)
+        # sessionRetention: 24h       (session offload window; absent/0 = retain in the store)
 ```
 
 Unknown keys are rejected (a typo guard); `path` must not collide with a
@@ -103,6 +107,7 @@ DSH_WEBHOOK_<NAME>_MODEL=some/model
 | `maxConcurrent` | `MAX_CONCURRENT` | 1 |
 | `maxQueue` | `MAX_QUEUE` | 100 |
 | `maxBodyBytes` | `MAX_BODY_BYTES` | 262144 |
+| `sessionRetention` | `SESSION_RETENTION` | absent (retain in the store) |
 
 - The id segment is the endpoint id uppercased with hyphens written as
   underscores (`ci-run` -> `DSH_WEBHOOK_CI_RUN_*`); multi-word suffixes are
@@ -119,6 +124,40 @@ DSH_WEBHOOK_<NAME>_MODEL=some/model
 `webhook { verb: "status" }` - the live endpoint state, the recent-delivery
 ring, and the effective (non-secret) endpoint config. See the
 `dsh-webhook-dispatcher` skill for the full reference.
+
+## Session offload
+
+Webhook dispatches leave on-disk session logs in the framework session store;
+at delivery volume (frequent or chatty endpoints) the store grows without
+bound. The per-minute offload sweep archives settled trigger sessions once
+their endpoint's `sessionRetention` window elapses, so the store stays
+bounded: the store is never deleted, only moved, and a session that is still
+running is kept until it settles.
+
+- **Windows**: `sessionRetention` is per-endpoint (the config layer's
+  `sessionRetention` field or the env
+  `DSH_WEBHOOK_<ID>_SESSION_RETENTION`): a non-negative integer number of
+  milliseconds, or a duration string of 1-2 digits+unit segments (units
+  d/h/m/s/ms) in descending order (e.g. `24h`, `4h30m`, `90s`, `5000ms`;
+  a bare numeric string is invalid). 0 / absent = retain (no offload); an
+  invalid value warns and is treated as 0 (never a boot failure).
+- **Budget**: `DSH_WEBHOOK_OFFLOAD_BATCH` (env, default 50) bounds the
+  sessions one sweep may process; an invalid value warns and falls back to
+  50, never disabling the sweep. When consecutive sweeps observe new log
+  lines arriving faster than the budget, the sweep logs a trend warning
+  (raise the knob or lower the retention windows; the warning takes no
+  action on its own).
+- **Failure semantics**: an unreachable persistence service, a missing store
+  root, or an archive on a different mount disables the sweep for that round
+  (a visible warning; log lines are never lost); a failed individual move is
+  retried next round.
+
+The offload state (retention log `retention-log.jsonl`, archive
+`archived-sessions/`, and the default trigger-session workspace) lives under
+the plugin home `$DSH_HOME/dsh-webhook-dispatcher/`. The selftest covers the
+offload plane as well (window parsing, retention-log mechanics, the sweep's
+window/liveness/budget/trend semantics, the dispatch write gate, the archive
+move, and the layout pin).
 
 ## Development
 

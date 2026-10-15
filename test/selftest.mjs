@@ -7,7 +7,8 @@
 // trigger-session spawn lifecycle, and the degradation paths).
 // Runs against the built lib/ (run `pnpm run build` first).
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -1055,6 +1056,23 @@ function makeFakeHandle({ events = [], sandboxOk = true, followupRejects = false
 }
 
 const okHandle = () => makeFakeHandle({ events: [{ type: 'turn/end', data: { reason: 'completed' } }] })
+
+/**
+ * Offload-plane service doubles: a persistence locator over the given store
+ * root (the framework jsonl layout, keyed on the cwd basename) and a live
+ * session registry whose membership a test can grow (empty = dead).
+ */
+function offloadDoubles(storeRoot, live = new Set()) {
+  return {
+    sessionPersistence: {
+      locate: (meta) => ({
+        kind: 'jsonl',
+        path: path.join(storeRoot, meta.cwd === undefined ? '' : path.basename(meta.cwd), meta.id, 'session.v4.jsonl.zstd'),
+      }),
+    },
+    sessions: { get: (id) => (live.has(id) ? { id } : undefined) },
+  }
+}
 // 1000-tick budget: the spawn chain includes real fs calls (mkdir, the
 // settings.yaml probe), and under a loaded event loop (concurrent tooling
 // sharing the libuv threadpool) those callbacks can outrun a smaller budget.
@@ -1199,9 +1217,14 @@ await okA('unknown-path no-leak (dispatch level): an unknown path reaches only t
 await okA('plugin: a delivery through the registered route runs the production spawn end to end', async () => {
   dropHandoverSlot()
   const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+  // The offload plane's first sweep round must stay silent: both its soft
+  // services are present and the store root exists on the harness home.
+  const storeRoot = path.join(wsTmp, 'sessions')
+  mkdirSync(storeRoot, { recursive: true })
   const { ctx, routes, logs } = makeFakeCtx({
     agents,
     dshHomePath: (p) => path.join(wsTmp, p),
+    ...offloadDoubles(storeRoot),
   })
   const plugin = new DshWebhookDispatcherPlugin(ctx, { endpoints: [{ ...ENDPOINT_GH, cwd: path.join(wsTmp, 'gh') }] })
   const res = fakeRes()
@@ -1483,54 +1506,1603 @@ await okA('plugin: a dropped endpoint logs one line with its stale counts on rec
   )
 })
 
+// ---------------------------------------------------------------- offload plane
+// The offload plane (retention window, retention log, the sweep, the plugin
+// lifecycle), in the same section order as the other offload plugins: O1 the
+// window grammar, O2 the retention log format, O3 the offload batch knob,
+// O4 the round-health gates, O5 the sweep entry-pass states, O6 the per-sweep
+// budget and compaction, O7 the growth-trend alert, O8 the periodic arming,
+// O9 the dispatch lifecycle through the real plugin, O10 the lost-log warning
+// and the append/rewrite mutex, O11 the layout pin.
+console.log('offload plane')
+{
+  const offload = await import(path.join(root, 'lib', 'offload.js'))
+  const {
+    COMPACTION_RATIO,
+    OffloadSweeper,
+    OFFLOAD_ARCHIVE_DIR,
+    OFFLOAD_HOME_BASE,
+    OFFLOAD_LOG_FILE,
+    OFFLOAD_STORE_ROOT,
+    appendRetentionEntry,
+    offloadLayout,
+    readRetentionLog,
+    rewriteRetentionLog,
+  } = offload
+  const retention = await import(path.join(root, 'lib', 'retention.js'))
+  const { DEFAULT_OFFLOAD_BATCH, parseOffloadBatch, parseWindowMs } = retention
+
+  const T0 = 1_000_000
+  const W = 60_000 // the endpoint retention window used across the sweep cases
+  const CWD = '/x/w' // a fake workspace; the fake persistence service keys on its basename
+  const WS = path.basename(CWD) // the store-root segment the workspace maps to
+  const iso = (ms) => new Date(ms).toISOString()
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const mapUnit = (ms = W) => new Map([['gh', ms]])
+
+  // A fake sessionPersistence service: locate() mirrors the framework jsonl
+  // layout (the session dir is the dirname of the log path; a cwd-less
+  // session lives at the store root's top level). Dispatched sessions always
+  // carry a workspace, so the cwd-less branch is exercised only by directly
+  // seeded log lines.
+  const makeSpService = (storeRoot) => ({
+    locate: (meta) => ({
+      kind: 'jsonl',
+      path: path.join(storeRoot, meta.cwd === undefined ? '' : path.basename(meta.cwd), meta.id, 'session.v4.jsonl.zstd'),
+    }),
+  })
+
+  // A fake live-session registry (the ctx.get('sessions') face; `known` is a
+  // mutable Set so a case can make a session live between two reads).
+  const makeRegistry = (known) => {
+    const set = known === undefined ? new Set() : known instanceof Set ? known : new Set(known)
+    return { known: set, get: (id) => (set.has(id) ? { id } : undefined) }
+  }
+
+  // A capturing minimal ctx for the component tests: ctx.get routes to the
+  // given services (soft read), the logger records warn/info/error lines.
+  const compCtx = (services = {}) => {
+    const warns = []
+    const infos = []
+    const mkLog = () => ({
+      warn: (m) => warns.push(m),
+      error: (m) => warns.push(m),
+      info: (m) => infos.push(m),
+      debug: () => {},
+    })
+    const ctx = { get: (name) => (name in services ? services[name] : undefined), logger: mkLog }
+    return { ctx, warns, infos }
+  }
+
+  // Build an OffloadSweeper rooted at a temp harness home (all the optional
+  // test seams default to the production behavior).
+  const makeSweeper = (home, opts = {}) => {
+    const services = opts.services ?? {}
+    const { ctx, warns, infos } = compCtx(services)
+    const storeRoot = opts.storeRoot ?? path.join(home, OFFLOAD_STORE_ROOT)
+    const pluginHome = path.join(home, OFFLOAD_HOME_BASE)
+    const sweeper = new OffloadSweeper({
+      ctx,
+      logger: ctx.logger(),
+      home: {
+        base: pluginHome,
+        archive: path.join(pluginHome, OFFLOAD_ARCHIVE_DIR),
+        log: path.join(pluginHome, OFFLOAD_LOG_FILE),
+        storeRoot,
+      },
+      units: () => (opts.units === undefined ? new Map() : opts.units),
+      inflight: opts.inflight ?? new Set(),
+      cap: opts.cap ?? DEFAULT_OFFLOAD_BATCH,
+      now: opts.now,
+      devOf: opts.devOf,
+      move: opts.move,
+    })
+    return { sweeper, warns, infos, storeRoot }
+  }
+
+  // One round of fixtures: setup builds the home (store dir, log lines,
+  // session dirs) and returns the sweeper handles; the round runs; the
+  // asserts get the report plus the fixture paths.
+  async function runCase(setup, verify) {
+    const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+    try {
+      const ctx = {
+        home,
+        storeRoot: path.join(home, OFFLOAD_STORE_ROOT),
+        logPath: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE),
+        archiveDir: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR),
+      }
+      const handles = await setup(ctx)
+      const report = await handles.sweeper.sweep()
+      await verify({ ...ctx, report, warns: handles.warns ?? [] })
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }
+
+  // Create a source session dir (the store side) the way the framework
+  // would, and return its path.
+  const makeSessionDir = (storeRoot, id, cwd) => {
+    const dir = path.join(storeRoot, cwd === undefined ? '' : path.basename(cwd), id)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, 'session.v4.jsonl.zstd'), 'log')
+    return dir
+  }
+
+  // -- O1: the retention window parser (number = ms; string = 1-2 segments
+  //        in descending unit order; the discriminating vectors rejected)
+  ok('O1a: number windows are non-negative integer ms', () =>
+    assert.deepEqual([parseWindowMs(0).ms, parseWindowMs(900000).ms], [0, 900000]),
+  )
+  ok('O1a: a negative, fractional or NaN number window is invalid', () =>
+    assert.ok(!parseWindowMs(-1).ok && !parseWindowMs(1.5).ok && !parseWindowMs(Number.NaN).ok),
+  )
+  ok('O1b: one-segment duration strings', () =>
+    assert.deepEqual(
+      [parseWindowMs('1d').ms, parseWindowMs('24h').ms, parseWindowMs('30m').ms, parseWindowMs('90s').ms, parseWindowMs('5000ms').ms],
+      [86_400_000, 86_400_000, 1_800_000, 90_000, 5000],
+    ),
+  )
+  ok('O1b: two-segment durations in descending unit order', () =>
+    assert.deepEqual(
+      [parseWindowMs('1h30m').ms, parseWindowMs('4h30m').ms, parseWindowMs('1m30s').ms, parseWindowMs('1s500ms').ms],
+      [5_400_000, 16_200_000, 90_000, 1500],
+    ),
+  )
+  ok('O1c: the discriminating vectors are all invalid (strict segment grammar)', () =>
+    assert.ok(
+      ['1h30m30s', '30m4h', '1w', '1h 30m', '30', '5000', 'h', '24H', '1ms2s', '1w30m', 'banana', ''].every((v) => !parseWindowMs(v).ok),
+    ),
+  )
+  ok('O1c: the range guard rejects overflow', () => assert.ok(!parseWindowMs('900000000d').ok))
+
+  // -- O2: the retention log (round trip, single append write per line, the
+  //        torn-tail repair, the bad-line skip, the atomic rewrite)
+  {
+    const dir = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+    try {
+      const log = path.join(dir, 'sub', 'retention-log.jsonl')
+      const r0 = await readRetentionLog(log)
+      ok('O2a: reading a missing log is an empty, un-repaired read', () =>
+        assert.deepEqual([r0.entries.length, r0.repaired, r0.badLines], [0, false, 0]),
+      )
+      await appendRetentionEntry(log, { id: 'a', createdAt: iso(1), unit: 'gh', cwd: '/x/w' })
+      await appendRetentionEntry(log, { id: 'b', createdAt: iso(2), unit: 'gh' })
+      const lines = readFileSync(log, 'utf8').split('\n')
+      ok('O2a: each append is exactly one complete line (single write per line)', () =>
+        assert.equal(lines.filter((l) => l !== '').length, 2),
+      )
+      ok('O2a: the cwd key is present for the first line and omitted for the second', () =>
+        assert.ok(lines[0].includes('"cwd":"/x/w"') && !lines[1].includes('cwd')),
+      )
+      const r1 = await readRetentionLog(log)
+      ok('O2a: the round trip preserves the entry shape and order', () =>
+        assert.equal(
+          JSON.stringify(r1.entries),
+          JSON.stringify([{ id: 'a', createdAt: iso(1), unit: 'gh', cwd: '/x/w' }, { id: 'b', createdAt: iso(2), unit: 'gh' }]),
+        ),
+      )
+      const torn = path.join(dir, 'torn.jsonl')
+      writeFileSync(torn, `{"id":"a","createdAt":"${iso(1)}","unit":"gh"}\n{"id":"p","createdAt":"${iso(2)}","unit":"gh"`)
+      const rt = await readRetentionLog(torn)
+      ok('O2b: a torn trailing line is repaired in place (back to the last newline)', () =>
+        assert.ok(
+          rt.repaired === true &&
+            rt.entries.length === 1 &&
+            readFileSync(torn, 'utf8') === `{"id":"a","createdAt":"${iso(1)}","unit":"gh"}\n`,
+        ),
+      )
+      await appendRetentionEntry(torn, { id: 'c', createdAt: iso(3), unit: 'gh' })
+      ok('O2b: an append after the repair lands on its own line', () =>
+        assert.ok(readFileSync(torn, 'utf8').endsWith(`{"id":"c","createdAt":"${iso(3)}","unit":"gh"}\n`)),
+      )
+      const torn2 = path.join(dir, 'torn2.jsonl')
+      writeFileSync(torn2, `{"id":"a","createdAt":"${iso(1)}","unit":"gh"`) // no trailing newline
+      await appendRetentionEntry(torn2, { id: 'c', createdAt: iso(3), unit: 'gh' })
+      const rt2 = await readRetentionLog(torn2)
+      ok('O2b: an append to a torn tail closes it first (the new line stays parseable)', () =>
+        assert.ok(
+          readFileSync(torn2, 'utf8') ===
+            `{"id":"a","createdAt":"${iso(1)}","unit":"gh"\n{"id":"c","createdAt":"${iso(3)}","unit":"gh"}\n` &&
+            [rt2.entries.length, rt2.badLines, rt2.repaired].join() === '1,1,false',
+        ),
+      )
+      const bad = path.join(dir, 'bad.jsonl')
+      writeFileSync(bad, `{"id":"a","createdAt":"${iso(1)}","unit":"gh"}\nnot json\n{"id":"b","createdAt":"${iso(2)}","unit":"gh"}\n`)
+      const rb = await readRetentionLog(bad)
+      ok('O2c: unparseable lines are skipped and counted', () =>
+        assert.deepEqual([rb.entries.length, rb.badLines, rb.repaired], [2, 1, false]),
+      )
+      await rewriteRetentionLog(log, [r1.entries[1]])
+      const r2 = await readRetentionLog(log)
+      ok('O2d: the compaction rewrite keeps exactly the survivors, in order', () =>
+        assert.deepEqual(r2.entries.map((e) => e.id), ['b']),
+      )
+      ok('O2d: no temp file remains after the rewrite', () => assert.ok(!existsSync(`${log}.tmp`)))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // -- O3: the offload batch knob (env DSH_WEBHOOK_OFFLOAD_BATCH: a positive
+  //        integer, or the warn-and-keep degradation; the window itself is an
+  //        endpoint field / DSH_WEBHOOK_<ID>_SESSION_RETENTION, exercised in
+  //        the plugin-level O9 cases)
+  {
+    ok('O3a: an absent knob falls back to the default', () =>
+      assert.equal(parseOffloadBatch(undefined, () => {}), DEFAULT_OFFLOAD_BATCH),
+    )
+    ok('O3a: a valid knob value is used', () => assert.equal(parseOffloadBatch('7', () => {}), 7))
+    ok('O3a: the default constant is 50', () => assert.equal(DEFAULT_OFFLOAD_BATCH, 50))
+    const warns = []
+    for (const v of ['0', '-2', 'abc', '5.5']) parseOffloadBatch(v, (m) => warns.push(m))
+    ok('O3b: each invalid knob value warns and falls back to the default', () => assert.equal(warns.length, 4))
+    ok('O3b: the warning names the knob', () => assert.ok(warns.every((m) => m.includes('DSH_WEBHOOK_OFFLOAD_BATCH'))))
+  }
+
+  // -- O4: round health (the disabled branches: unreachable persistence
+  //        service, missing store root, the mount mismatch; the registry
+  //        fallback to the in-flight set)
+  {
+    await runCase(
+      ({ home, storeRoot }) => {
+        mkdirSync(storeRoot)
+        return makeSweeper(home, { storeRoot, services: {} })
+      },
+      ({ report, warns }) => {
+        ok('O4a: an unreachable persistence service skips the round with a warning', () => {
+          assert.ok(report.disabled !== undefined)
+          assert.ok(warns.some((m) => m.includes('persistence service is unreachable')))
+        })
+        ok('O4a: the skipped round performs no action', () =>
+          assert.deepEqual([report.candidates, report.offloaded, report.balance], [0, 0, 0]),
+        )
+      },
+    )
+    await runCase(
+      ({ home, storeRoot }) => {
+        // The store root is never created (missing on this host).
+        return makeSweeper(home, { storeRoot, services: { sessionPersistence: makeSpService(storeRoot) } })
+      },
+      ({ report, warns }) => {
+        ok('O4b: a missing store root disables the round with a warning', () => {
+          assert.ok(report.disabled !== undefined)
+          assert.ok(warns.some((m) => m.includes('store root is missing')))
+        })
+      },
+    )
+    await runCase(
+      ({ home, storeRoot }) => {
+        mkdirSync(storeRoot)
+        return makeSweeper(home, {
+          storeRoot,
+          services: { sessionPersistence: makeSpService(storeRoot) },
+          devOf: (p) => Promise.resolve(p.includes(OFFLOAD_ARCHIVE_DIR) ? 1 : 2),
+        })
+      },
+      ({ report, warns }) => {
+        ok('O4c: a mount mismatch disables the round with a warning', () => {
+          assert.ok(report.disabled !== undefined)
+          assert.ok(warns.some((m) => m.includes('different mounts')))
+        })
+      },
+    )
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'o4', CWD)
+        await appendRetentionEntry(logPath, { id: 'o4', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot) },
+          now: () => T0,
+        })
+      },
+      ({ report, warns }) => {
+        ok('O4d: an unreachable registry falls back to the in-flight set with a warning', () => {
+          assert.equal(report.offloaded, 1)
+          assert.ok(warns.some((m) => m.includes('registry service is unreachable')))
+        })
+      },
+    )
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'o4', CWD)
+        await appendRetentionEntry(logPath, { id: 'o4', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          inflight: new Set(['o4']),
+          services: { sessionPersistence: makeSpService(storeRoot) },
+          now: () => T0,
+        })
+      },
+      async ({ report, warns, logPath }) => {
+        ok('O4d: with the registry unreachable the in-flight set alone gates liveness', () => {
+          assert.equal(report.skippedLive, 1)
+          assert.ok(warns.some((m) => m.includes('registry service is unreachable')))
+        })
+        await okA('O4d: the live entry stays in the log', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 1),
+        )
+      },
+    )
+  }
+
+  // -- O5: the sweep core (window semantics, the existence table, the
+  //        liveness rollback, the retry, the unit-gone rule)
+  {
+    // Cell 1: source present, destination absent (the normal path).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'c1', CWD)
+        await appendRetentionEntry(logPath, { id: 'c1', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      async ({ report, storeRoot, archiveDir, logPath }) => {
+        ok('O5a: the over-window settled session is offloaded', () =>
+          assert.deepEqual([report.offloaded, report.candidates], [1, 1]),
+        )
+        ok('O5a: the session dir left the store and entered the archive', () => {
+          assert.ok(!existsSync(path.join(storeRoot, WS, 'c1')))
+          assert.ok(existsSync(path.join(archiveDir, 'c1')))
+        })
+        await okA('O5a: the completed line is removed by the compaction rewrite', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 0),
+        )
+      },
+    )
+    // Cell 2: neither side (the session was cleaned up externally).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        await appendRetentionEntry(logPath, { id: 'c2', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      async ({ report, logPath }) => {
+        ok('O5b: a session on neither side completes (source gone)', () =>
+          assert.deepEqual([report.sourceGone, report.offloaded, report.errors], [1, 0, 0]),
+        )
+        await okA('O5b: the completed line is removed', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 0),
+        )
+      },
+    )
+    // Cell 3: the archive already holds the session (an earlier round moved it).
+    await runCase(
+      async ({ home, storeRoot, archiveDir, logPath }) => {
+        mkdirSync(storeRoot)
+        mkdirSync(path.join(archiveDir, 'c3'), { recursive: true })
+        writeFileSync(path.join(archiveDir, 'c3', 'session.v4.jsonl.zstd'), 'log')
+        await appendRetentionEntry(logPath, { id: 'c3', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      async ({ report, logPath }) => {
+        ok('O5c: a session already in the archive completes (already archived)', () =>
+          assert.deepEqual([report.alreadyArchived, report.offloaded, report.errors], [1, 0, 0]),
+        )
+        await okA('O5c: the completed line is removed', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 0),
+        )
+      },
+    )
+    // Cell 4: both sides present (a true conflict the sweep must not resolve).
+    await runCase(
+      async ({ home, storeRoot, archiveDir, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'c4', CWD)
+        mkdirSync(path.join(archiveDir, 'c4'), { recursive: true })
+        writeFileSync(path.join(archiveDir, 'c4', 'session.v4.jsonl.zstd'), 'log')
+        await appendRetentionEntry(logPath, { id: 'c4', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      async ({ report, storeRoot, archiveDir, logPath, warns }) => {
+        ok('O5d: both sides present is an error, both sides kept', () => {
+          assert.deepEqual([report.errors, report.offloaded], [1, 0])
+          assert.ok(warns.some((m) => m.includes('both exist for session c4')))
+        })
+        ok('O5d: the source is intact and the archive side untouched', () => {
+          assert.ok(existsSync(path.join(storeRoot, WS, 'c4')))
+          assert.ok(existsSync(path.join(archiveDir, 'c4')))
+        })
+        await okA('O5d: the line stays in the log', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 1),
+        )
+      },
+    )
+    // A rename that fails with a transport error: the entry is kept, the
+    // round retries it next time.
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eio', CWD)
+        await appendRetentionEntry(logPath, { id: 'eio', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        const err = new Error('i/o')
+        err.code = 'EIO'
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+          move: () => Promise.reject(err),
+        })
+      },
+      async ({ report, storeRoot, logPath, warns }) => {
+        ok('O5e: a rename transport failure is an error, the entry is kept', () => {
+          assert.deepEqual([report.errors, report.offloaded], [1, 0])
+          assert.ok(warns.some((m) => m.includes('retried next round')))
+        })
+        ok('O5e: the source is intact', () => assert.ok(existsSync(path.join(storeRoot, WS, 'eio'))))
+        await okA('O5e: the line stays in the log', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 1),
+        )
+      },
+    )
+    // A rename that reports ENOENT (the source vanished between the check
+    // and the move).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eno', CWD)
+        await appendRetentionEntry(logPath, { id: 'eno', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        const err = new Error('no such file')
+        err.code = 'ENOENT'
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+          move: () => Promise.reject(err),
+        })
+      },
+      async ({ report, logPath }) => {
+        ok('O5f: a rename ENOENT converges to source-gone', () =>
+          assert.deepEqual([report.sourceGone, report.errors], [1, 0]),
+        )
+        await okA('O5f: the entry completed and its line was removed', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 0),
+        )
+      },
+    )
+    // A rename that reports EEXIST with the source gone (an earlier round
+    // moved it).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eex', CWD)
+        await appendRetentionEntry(logPath, { id: 'eex', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        const err = new Error('file exists')
+        err.code = 'EEXIST'
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+          move: async (s) => {
+            rmSync(s, { recursive: true, force: true })
+            throw err
+          },
+        })
+      },
+      async ({ report, logPath }) => {
+        ok('O5g: an EEXIST with the source gone means the offload already happened', () =>
+          assert.deepEqual([report.alreadyArchived, report.errors], [1, 0]),
+        )
+        await okA('O5g: the entry completed', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 0),
+        )
+      },
+    )
+    // A rename that reports EEXIST with the source still present (a true
+    // conflict).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'eex', CWD)
+        await appendRetentionEntry(logPath, { id: 'eex', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        const err = new Error('file exists')
+        err.code = 'EEXIST'
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+          move: () => Promise.reject(err),
+        })
+      },
+      async ({ report, storeRoot, logPath, warns }) => {
+        ok('O5g: an EEXIST with the source present is an error, both sides kept', () => {
+          assert.deepEqual([report.errors, report.offloaded], [1, 0])
+          assert.ok(warns.some((m) => m.includes('both sides remain')))
+        })
+        ok('O5g: the source is intact', () => assert.ok(existsSync(path.join(storeRoot, WS, 'eex'))))
+        await okA('O5g: the line stays in the log', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 1),
+        )
+      },
+    )
+    // The locate call itself throws (a broken persistence backend).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        const broken = { locate: () => { throw new Error('backend down') } }
+        await appendRetentionEntry(logPath, { id: 'loc', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: broken, sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      async ({ report, logPath, warns }) => {
+        ok('O5h: a locate failure keeps the entry for the next round', () => {
+          assert.deepEqual([report.errors, report.offloaded], [1, 0])
+          assert.ok(warns.some((m) => m.includes('locating session loc failed')))
+        })
+        await okA('O5h: the line stays in the log', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 1),
+        )
+      },
+    )
+    // The liveness rollback: the session goes live between the gate and the
+    // move (the source is moved back, the entry is kept).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'rb', CWD)
+        await appendRetentionEntry(logPath, { id: 'rb', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        const reg = makeRegistry()
+        const quiet = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }
+        const services = { sessionPersistence: makeSpService(storeRoot), sessions: reg }
+        return {
+          sweeper: new OffloadSweeper({
+            ctx: { get: (name) => (name in services ? services[name] : undefined) },
+            logger: quiet,
+            home: {
+              base: path.join(home, OFFLOAD_HOME_BASE),
+              archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR),
+              log: logPath,
+              storeRoot,
+            },
+            units: () => mapUnit(),
+            inflight: new Set(),
+            cap: DEFAULT_OFFLOAD_BATCH,
+            now: () => T0,
+            move: async () => {
+              reg.known.add('rb') // the session goes live in the gap
+            },
+          }),
+        }
+      },
+      async ({ report, storeRoot, archiveDir, logPath }) => {
+        ok('O5i: a session that goes live in the gap is neither offloaded nor an error', () =>
+          assert.deepEqual([report.offloaded, report.errors, report.skippedLive], [0, 0, 0]),
+        )
+        ok('O5i: the rollback moved the session back to the store', () => {
+          assert.ok(existsSync(path.join(storeRoot, WS, 'rb')))
+          assert.ok(!existsSync(path.join(archiveDir, 'rb')))
+        })
+        await okA('O5i: the entry is kept for the next round', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 1),
+        )
+      },
+    )
+    // The unit-gone rule: no age check, the liveness gate still applies.
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'ug', CWD)
+        await appendRetentionEntry(logPath, { id: 'ug', createdAt: iso(T0 - 1000), unit: 'ghost', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      ({ report, archiveDir }) => {
+        ok('O5j: a vanished unit is offloaded immediately, regardless of age', () =>
+          assert.deepEqual([report.offloaded, report.candidates], [1, 1]),
+        )
+        ok('O5j: the fresh (within-window-age) session was moved', () => assert.ok(existsSync(path.join(archiveDir, 'ug'))))
+      },
+    )
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'ugl', CWD)
+        const reg = makeRegistry(['ugl'])
+        await appendRetentionEntry(logPath, { id: 'ugl', createdAt: iso(T0 - 1000), unit: 'ghost', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: reg },
+          now: () => T0,
+        })
+      },
+      ({ report }) => {
+        ok('O5j: the liveness gate still applies to a vanished unit', () =>
+          assert.deepEqual([report.skippedLive, report.offloaded], [1, 0]),
+        )
+      },
+    )
+    // The window-0 unit (retention closed): entries are kept, never
+    // candidates.
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'keep', CWD)
+        await appendRetentionEntry(logPath, { id: 'keep', createdAt: iso(T0 - 10 * 365 * W), unit: 'cold', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: new Map([['cold', 0]]),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      async ({ report, logPath }) => {
+        ok('O5k: a window-0 unit keeps even ancient entries', () =>
+          assert.deepEqual([report.candidates, report.offloaded], [0, 0]),
+        )
+        await okA('O5k: the line survives', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 1),
+        )
+      },
+    )
+    // Reopening the window re-manages the retained entries (over-window
+    // offloaded, within-window kept).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'old', CWD)
+        makeSessionDir(storeRoot, 'new', CWD)
+        await appendRetentionEntry(logPath, { id: 'old', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        await appendRetentionEntry(logPath, { id: 'new', createdAt: iso(T0 - 1000), unit: 'gh', cwd: CWD })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      ({ report, archiveDir, storeRoot }) => {
+        ok('O5l: the reopened window offloads the over-window entries and keeps the fresh one', () =>
+          assert.deepEqual([report.offloaded, report.candidates], [1, 1]),
+        )
+        ok('O5l: the over-window session is archived, the fresh one stays in the store', () => {
+          assert.ok(existsSync(path.join(archiveDir, 'old')))
+          assert.ok(existsSync(path.join(storeRoot, WS, 'new')))
+        })
+      },
+    )
+    // A cwd-less entry resolves through the store root's top level (a line
+    // written before the workspace convention, or by an older plugin).
+    await runCase(
+      async ({ home, storeRoot, logPath }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'nc', undefined)
+        await appendRetentionEntry(logPath, { id: 'nc', createdAt: iso(T0 - 2 * W), unit: 'gh' })
+        return makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+      },
+      ({ report, archiveDir }) => {
+        ok('O5m: a cwd-less entry is offloaded through the store-root top level', () =>
+          assert.deepEqual([report.offloaded, report.errors], [1, 0]),
+        )
+        ok('O5m: the archive copy is named after the session id', () => assert.ok(existsSync(path.join(archiveDir, 'nc'))))
+      },
+    )
+    // The archive dir is rebuilt after external deletion (the next round
+    // heals).
+    await runCase(
+      async ({ home, storeRoot, logPath, archiveDir }) => {
+        mkdirSync(storeRoot)
+        makeSessionDir(storeRoot, 'h1', CWD)
+        makeSessionDir(storeRoot, 'h2', CWD)
+        await appendRetentionEntry(logPath, { id: 'h1', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        await appendRetentionEntry(logPath, { id: 'h2', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        const handles = makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+        await handles.sweeper.sweep() // the first round: both offloaded, the archive exists
+        rmSync(archiveDir, { recursive: true, force: true }) // the operator wiped it
+        makeSessionDir(storeRoot, 'h3', CWD)
+        await appendRetentionEntry(logPath, { id: 'h3', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        return handles
+      },
+      ({ report, archiveDir }) => {
+        ok('O5n: after the archive dir was deleted externally the next round rebuilds it and continues', () =>
+          assert.deepEqual([report.offloaded, report.errors], [1, 0]),
+        )
+        ok('O5n: the rebuilt archive holds the new offload', () => assert.ok(existsSync(path.join(archiveDir, 'h3'))))
+      },
+    )
+  }
+
+  // -- O6: the per-sweep budget (file order, the oldest-first identity, the
+  //        knob, the compaction regimes, sweep idempotency)
+  {
+    // 51 candidates with the default cap of 50: the first round takes the
+    // fifty oldest (file order), the second round the remainder.
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        for (let i = 0; i < 51; i++) {
+          const id = `n${String(i).padStart(2, '0')}`
+          makeSessionDir(storeRoot, id, CWD)
+          await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        }
+        const { sweeper } = makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+        const first = await sweeper.sweep()
+        ok('O6a: the first round offloads exactly the budget', () =>
+          assert.deepEqual([first.offloaded, first.candidates], [50, 50]),
+        )
+        await okA('O6a: the identity is the single remainder line, in file order', async () =>
+          assert.equal(
+            JSON.stringify((await readRetentionLog(logPath)).entries.map((e) => e.id)),
+            JSON.stringify(['n50']),
+          ),
+        )
+        const second = await sweeper.sweep()
+        ok('O6a: the second round offloads the single remainder', () =>
+          assert.deepEqual([second.offloaded, second.candidates], [1, 1]),
+        )
+        await okA('O6a: the log is empty after both rounds', async () =>
+          assert.equal((await readRetentionLog(logPath)).entries.length, 0),
+        )
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // The knob: cap 3 over five candidates (three offloaded in file order,
+    // then two).
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        for (const id of ['k1', 'k2', 'k3', 'k4', 'k5']) {
+          makeSessionDir(storeRoot, id, CWD)
+          await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        }
+        const { sweeper } = makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          cap: 3,
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+        const first = await sweeper.sweep()
+        ok('O6b: a valid knob value caps the round', () => assert.deepEqual([first.offloaded, first.candidates], [3, 3]))
+        const second = await sweeper.sweep()
+        ok('O6b: the remainder drains on the next round', () => assert.equal(second.offloaded, 2))
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // Compaction regime 1: the rate fits the budget (the file drains to
+    // steady state, the second round is a zero-action no-op).
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        for (let i = 0; i < 30; i++) {
+          const id = `s${i}`
+          makeSessionDir(storeRoot, id, CWD)
+          await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        }
+        const { sweeper } = makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+        const first = await sweeper.sweep()
+        ok('O6c: the rate within the budget drains the file in one round', () =>
+          assert.deepEqual([first.offloaded, first.removedLines, first.balance], [30, 30, 0]),
+        )
+        ok('O6c: the compaction ratio triggered the rewrite', () => assert.equal(first.completedRatio, 1))
+        const second = await sweeper.sweep()
+        ok('O6c: the next round is a zero-action no-op (sweep idempotency)', () =>
+          assert.deepEqual([second.candidates, second.offloaded, second.removedLines, second.balance, second.increment], [0, 0, 0, 0, 0]),
+        )
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // Compaction regime 2: the rate exceeds the budget (the rewrite runs
+    // while the completed share stays high; the balance creeps up by the
+    // overrun per round).
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        const archiveDir = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR)
+        mkdirSync(storeRoot)
+        const { sweeper } = makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          cap: 3,
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+        const rounds = []
+        for (let r = 0; r < 3; r++) {
+          for (let i = 0; i < 5; i++) {
+            const id = `q${r}${i}`
+            makeSessionDir(storeRoot, id, CWD)
+            await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+          }
+          rounds.push(await sweeper.sweep())
+        }
+        ok('O6d: the over-budget rate rewrites while the completed share stays high', () =>
+          assert.equal(
+            JSON.stringify(rounds.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])),
+            JSON.stringify([[3, 3, 2], [3, 3, 4], [3, 3, 6]]),
+          ),
+        )
+        ok('O6d: every offload landed in the archive', () => {
+          assert.ok(existsSync(path.join(archiveDir, 'q00')))
+          assert.ok(existsSync(path.join(archiveDir, 'q13')))
+        })
+        ok('O6d: the file line count equals the reported balance', () =>
+          assert.equal(readFileSync(logPath, 'utf8').trim().split('\n').length, 6),
+        )
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+  }
+
+  // -- O7: the trend alert (the consecutive over-envelope increments, the
+  //        healthy negatives, the out-of-regime dormant branch, the knob
+  //        recovery)
+  {
+    // Positive: the arrivals keep exceeding the budget for K rounds in a row.
+    // (The first round only re-derives the balance baseline: it never judges.)
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const { sweeper } = makeSweeper(home, {
+          storeRoot,
+          units: new Map([['cold', 0]]),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+        const results = []
+        for (let r = 0; r < 13; r++) {
+          for (let i = 0; i < 60; i++) await appendRetentionEntry(logPath, { id: `t${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
+          results.push(await sweeper.sweep())
+        }
+        ok('O7a: the alert fires exactly on the K-th consecutive over-envelope sweep', () =>
+          assert.equal(
+            JSON.stringify(results.map((rp) => rp.trendAlert)),
+            JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true, true]),
+          ),
+        )
+        ok('O7a: the balance grows by the arrivals each round', () => assert.equal(results[12].balance, 13 * 60))
+        ok('O7a: the reported increment is the arrivals', () => assert.equal(results[12].increment, 60))
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // Healthy negative: bursts shorter than K rounds reset the counter.
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const { sweeper } = makeSweeper(home, {
+          storeRoot,
+          units: new Map([['cold', 0]]),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+        const results = []
+        for (let r = 0; r < 8; r++) {
+          const burst = r < 3 ? 60 : 0
+          for (let i = 0; i < burst; i++) await appendRetentionEntry(logPath, { id: `h${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
+          results.push(await sweeper.sweep())
+        }
+        ok('O7b: a burst shorter than K rounds never alerts', () => assert.ok(results.every((rp) => !rp.trendAlert)))
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // At the boundary: arrivals equal to the budget are not over it (strict).
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot)
+        const { sweeper } = makeSweeper(home, {
+          storeRoot,
+          units: new Map([['cold', 0]]),
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+          now: () => T0,
+        })
+        const results = []
+        for (let r = 0; r < 12; r++) {
+          for (let i = 0; i < 50; i++) await appendRetentionEntry(logPath, { id: `b${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
+          results.push(await sweeper.sweep())
+        }
+        ok('O7c: arrivals at exactly the budget never alert (the comparison is strict)', () =>
+          assert.ok(results.every((rp) => !rp.trendAlert)),
+        )
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // Out of regime: the rate is at least four times the budget (the
+    // compaction trigger stays dormant, the alert is the visible signal);
+    // raising the knob recovers it and flushes the completed backlog.
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        const services = { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }
+        const units = mapUnit()
+        const quiet = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }
+        const mkCtx = () => ({ get: (name) => (name in services ? services[name] : undefined), logger: () => quiet })
+        let sweeper = new OffloadSweeper({
+          ctx: mkCtx(),
+          logger: quiet,
+          home: {
+            base: path.join(home, OFFLOAD_HOME_BASE),
+            archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR),
+            log: logPath,
+            storeRoot,
+          },
+          units: () => units,
+          inflight: new Set(),
+          cap: 5,
+          now: () => T0,
+        })
+        const results = []
+        for (let r = 0; r < 12; r++) {
+          for (let i = 0; i < 21; i++) {
+            const id = `o${r}-${i}`
+            makeSessionDir(storeRoot, id, CWD)
+            await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+          }
+          results.push(await sweeper.sweep())
+        }
+        ok('O7d: the out-of-regime rate alerts after K consecutive rounds', () =>
+          assert.equal(
+            JSON.stringify(results.map((rp) => rp.trendAlert)),
+            JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true]),
+          ),
+        )
+        ok('O7d: the compaction trigger stayed dormant through the whole burst', () =>
+          assert.ok(results.every((rp) => rp.removedLines === 0 && rp.completedRatio < COMPACTION_RATIO)),
+        )
+        ok('O7d: the deadweight backlog accumulated in the log file', () =>
+          assert.equal(readFileSync(logPath, 'utf8').trim().split('\n').length, 12 * 21),
+        )
+        // The operator raises the knob: a fresh instance (like a process
+        // restart) re-derives the baseline and the streak starts over.
+        sweeper = new OffloadSweeper({
+          ctx: mkCtx(),
+          logger: quiet,
+          home: {
+            base: path.join(home, OFFLOAD_HOME_BASE),
+            archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR),
+            log: logPath,
+            storeRoot,
+          },
+          units: () => units,
+          inflight: new Set(),
+          cap: 25,
+          now: () => T0,
+        })
+        const recovery = []
+        for (let r = 0; r < 3; r++) {
+          recovery.push(await sweeper.sweep())
+        }
+        ok('O7d: the raised knob re-enables the compaction trigger and flushes the backlog', () =>
+          assert.equal(
+            JSON.stringify(recovery.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])),
+            JSON.stringify([[25, 85, 167], [25, 0, 167], [25, 50, 117]]),
+          ),
+        )
+        ok('O7d: no trend alert under the recovered budget', () => assert.ok(recovery.every((rp) => !rp.trendAlert)))
+        const survivors = await readRetentionLog(logPath)
+        ok('O7d: only the pending (never-offloaded) lines survived the flush', () =>
+          assert.equal(survivors.entries.length, 117),
+        )
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    // O7e: the alert line content (growth rate = (increment - cap) per sweep
+    // and the branch discriminator: dormant out-of-regime vs active in-regime).
+    {
+      for (const [arrivals, cap, dormant] of [
+        [21, 5, true],
+        [12, 10, false],
+      ]) {
+        const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+        try {
+          const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+          const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+          const services = { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() }
+          const units = mapUnit()
+          const warns = []
+          const mkLog = () => ({ warn: (m) => warns.push(m), error: () => {}, info: () => {}, debug: () => {} })
+          const sweeper = new OffloadSweeper({
+            ctx: { get: (name) => (name in services ? services[name] : undefined), logger: mkLog },
+            logger: mkLog(),
+            home: {
+              base: path.join(home, OFFLOAD_HOME_BASE),
+              archive: path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR),
+              log: logPath,
+              storeRoot,
+            },
+            units: () => units,
+            inflight: new Set(),
+            cap,
+            now: () => T0,
+          })
+          for (let r = 0; r < 12; r++) {
+            for (let i = 0; i < arrivals; i++) {
+              const id = `x${arrivals}-${r}-${i}`
+              makeSessionDir(storeRoot, id, CWD)
+              await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+            }
+            await sweeper.sweep()
+          }
+          const alert = warns.find((m) => m.includes('trend alert'))
+          const want = dormant
+            ? ['growth rate 16/sweep', 'permanently dormant', 'completed lines are never evicted', 'check the offload batch knob first']
+            : ['growth rate 2/sweep', 'still active', 'raise the offload batch knob or lower the dispatch rate']
+          ok(`O7e: the alert line carries the ${dormant ? 'dormant-branch' : 'active-branch'} content`, () => {
+            assert.ok(alert !== undefined)
+            for (const f of want) assert.ok(alert.includes(f), `missing: ${f}`)
+          })
+          sweeper.dispose()
+        } finally {
+          rmSync(home, { recursive: true, force: true })
+        }
+      }
+    }
+  }
+
+  // -- O8: the periodic arming (the immediate first round, re-arm is a
+  //        no-op, the disposer stops the timer)
+  {
+    const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+    try {
+      const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+      mkdirSync(storeRoot, { recursive: true })
+      const { sweeper, infos } = makeSweeper(home, {
+        storeRoot,
+        services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+      })
+      sweeper.start()
+      await flush()
+      ok('O8a: start arms an immediate first round', () => assert.ok(infos.some((m) => m.includes('sweep done'))))
+      sweeper.start() // re-arming is a no-op
+      sweeper.dispose()
+      ok('O8a: dispose stops the timer without error', () => true)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }
+
+  // -- O9: the dispatch lifecycle through the real plugin (the write gate,
+  //        the end-to-end archive move, the liveness gates, the units
+  //        snapshot, the plane-unloaded degradation)
+  {
+    // Construct the real plugin on a fresh harness home with the offload
+    // plane loaded, and return the fixture handles.
+    function pluginProbe({ endpoints, agents, live } = {}) {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+      mkdirSync(storeRoot, { recursive: true })
+      const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+      const { ctx, routes, logs, effects } = makeFakeCtx({
+        agents,
+        dshHomePath: (p) => path.join(home, p),
+        ...offloadDoubles(storeRoot, live),
+      })
+      const plugin = new DshWebhookDispatcherPlugin(ctx, { endpoints })
+      return { home, storeRoot, logPath, ctx, routes, logs, effects, plugin }
+    }
+    // Fire one delivery through the registered /gh route and hand back the
+    // response double.
+    function fireDelivery({ routes }) {
+      const res = fakeRes()
+      const { req, deliver } = fakeReq({ method: 'POST', body: Buffer.from('ping'), headers: { 'content-type': 'text/plain' } })
+      routes.get('/gh').handler(req, res)
+      deliver()
+      return res
+    }
+
+    // O9a: the write gate open - a dispatched settled session is logged with
+    // the session id, the endpoint unit, the dispatch time and the shared
+    // workspace (the D18 default).
+    await okA('O9a: a dispatched session with a retention window records the line (the write gate)', async () => {
+      dropHandoverSlot()
+      const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+      const { home, logPath, routes, effects, plugin } = pluginProbe({
+        endpoints: [{ ...ENDPOINT_GH, sessionRetention: '24h' }],
+        agents,
+      })
+      fireDelivery({ routes })
+      await flush()
+      assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+      const sid = plugin.status().endpoints[0].lastDelivery.sessionId
+      const lines = (await readRetentionLog(logPath)).entries
+      assert.equal(lines.length, 1)
+      assert.equal(lines[0].id, sid)
+      assert.equal(lines[0].unit, 'gh')
+      assert.equal(lines[0].cwd, path.join(home, OFFLOAD_HOME_BASE, 'workspace'))
+      assert.ok(!Number.isNaN(Date.parse(lines[0].createdAt)))
+      assert.equal(plugin['offloadInflight'].size, 0)
+      disposeAll(effects)
+      rmSync(home, { recursive: true, force: true })
+    })
+    // O9b: the write gate closed - a zero window is not tracked.
+    await okA('O9b: a zero-window (unconfigured) endpoint records nothing (the write gate closed)', async () => {
+      dropHandoverSlot()
+      const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+      const { home, logPath, routes, effects, plugin } = pluginProbe({ endpoints: [ENDPOINT_GH], agents })
+      fireDelivery({ routes })
+      await flush()
+      await sleep(50) // any (skipped) retention append would have settled by now
+      assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+      assert.ok(!existsSync(logPath))
+      assert.equal(plugin['offloadInflight'].size, 0)
+      disposeAll(effects)
+      rmSync(home, { recursive: true, force: true })
+    })
+    // O9c: the write gate, workspace side - a session whose workspace could
+    // not be prepared is never tracked (its store location is undeterminable).
+    await okA('O9c: a session whose workspace could not be prepared is never tracked (silent)', async () => {
+      dropHandoverSlot()
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+      mkdirSync(storeRoot, { recursive: true })
+      // A file where the workspace directory must be created: the
+      // preparation fails (ENOTDIR), the session is created without a
+      // workspace.
+      const blocker = path.join(home, 'blocker')
+      writeFileSync(blocker, 'file')
+      const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+      const { ctx, routes, logs, effects } = makeFakeCtx({
+        agents,
+        dshHomePath: (p) => path.join(home, p),
+        ...offloadDoubles(storeRoot),
+      })
+      const plugin = new DshWebhookDispatcherPlugin(ctx, {
+        endpoints: [{ ...ENDPOINT_GH, cwd: path.join(blocker, 'sub'), sessionRetention: '24h' }],
+      })
+      fireDelivery({ routes })
+      await flush()
+      assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+      assert.ok(logs.warn.some((m) => m.includes('workspace preparation failed')))
+      assert.ok(!existsSync(path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)))
+      assert.equal(plugin['offloadInflight'].size, 0)
+      disposeAll(effects)
+      rmSync(home, { recursive: true, force: true })
+    })
+    // O9d: the end-to-end archive move through the plugin's own sweeper.
+    await okA('O9d: an over-window settled session is offloaded end to end through the plugin sweeper', async () => {
+      dropHandoverSlot()
+      const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+      const { home, storeRoot, logPath, routes, effects, plugin } = pluginProbe({
+        endpoints: [{ ...ENDPOINT_GH, sessionRetention: '1ms' }],
+        agents,
+      })
+      fireDelivery({ routes })
+      await flush()
+      assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+      const sid = plugin.status().endpoints[0].lastDelivery.sessionId
+      // The framework store gains the settled session's log (the offload
+      // source).
+      mkdirSync(path.join(storeRoot, 'workspace', sid), { recursive: true })
+      writeFileSync(path.join(storeRoot, 'workspace', sid, 'session.v4.jsonl.zstd'), 'log')
+      await sleep(60) // age past the 1ms window
+      const report = await plugin['sweeper'].sweep()
+      assert.deepEqual([report.offloaded, report.candidates], [1, 1])
+      assert.ok(!existsSync(path.join(storeRoot, 'workspace', sid)))
+      assert.ok(existsSync(path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR, sid)))
+      assert.equal((await readRetentionLog(logPath)).entries.length, 0)
+      disposeAll(effects)
+      rmSync(home, { recursive: true, force: true })
+    })
+    // O9e: the registry liveness gate (a session live in the framework
+    // registry is never offloaded).
+    await okA('O9e: a session that is live in the registry is never offloaded (the liveness gate)', async () => {
+      dropHandoverSlot()
+      const live = new Set()
+      const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+      const { home, storeRoot, logPath, routes, effects, plugin } = pluginProbe({
+        endpoints: [{ ...ENDPOINT_GH, sessionRetention: '1ms' }],
+        agents,
+        live,
+      })
+      fireDelivery({ routes })
+      await flush()
+      const sid = plugin.status().endpoints[0].lastDelivery.sessionId
+      live.add(sid)
+      mkdirSync(path.join(storeRoot, 'workspace', sid), { recursive: true })
+      writeFileSync(path.join(storeRoot, 'workspace', sid, 'session.v4.jsonl.zstd'), 'log')
+      await sleep(60)
+      const report = await plugin['sweeper'].sweep()
+      assert.equal(report.skippedLive, 1)
+      assert.ok(existsSync(path.join(storeRoot, 'workspace', sid)))
+      assert.equal((await readRetentionLog(logPath)).entries.length, 1)
+      disposeAll(effects)
+      rmSync(home, { recursive: true, force: true })
+    })
+    // O9f: the in-flight gate (an unsettled dispatch is never offloaded,
+    // regardless of age).
+    await okA('O9f: an unsettled (in-flight) dispatch is never offloaded', async () => {
+      dropHandoverSlot()
+      const hang = makeFakeHandle({ events: [{ type: 'turn/end', data: { reason: 'completed' } }] })
+      hang.handle.agent.whenIdle = () => new Promise(() => {}) // the settlement never completes
+      const agents = makeFakeAgents(() => Promise.resolve(hang.handle))
+      const { home, logPath, routes, effects, plugin } = pluginProbe({
+        endpoints: [{ ...ENDPOINT_GH, sessionRetention: '1ms' }],
+        agents,
+      })
+      fireDelivery({ routes })
+      await flush()
+      const st = plugin.status()
+      assert.equal(st.endpoints[0].inFlight, 1)
+      // The 202 already recorded the delivery as accepted; settlement
+      // (and the final outcome) never completes while the session is hung.
+      assert.equal(st.endpoints[0].lastDelivery.outcome, 'accepted')
+      assert.equal(st.endpoints[0].lastDelivery.sessionId, undefined)
+      assert.equal((await readRetentionLog(logPath)).entries.length, 1)
+      assert.equal(plugin['offloadInflight'].size, 1)
+      await sleep(60) // age past the 1ms window
+      const report = await plugin['sweeper'].sweep()
+      assert.equal(report.skippedLive, 1)
+      assert.equal((await readRetentionLog(logPath)).entries.length, 1)
+      disposeAll(effects)
+      rmSync(home, { recursive: true, force: true })
+    })
+    // O9g: the units snapshot (a rebuilt plugin instance carries its own
+    // endpoint view; a removed endpoint is a vanished unit whose pending
+    // lines follow the non-retention semantics).
+    await okA('O9g: a rebuilt instance carries its own endpoint view (a removed endpoint is a vanished unit)', async () => {
+      dropHandoverSlot()
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+      mkdirSync(storeRoot, { recursive: true })
+      const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+      // Instance A: the endpoint with a retention window dispatches (the line
+      // is written; the window is too wide to offload anything while A lives).
+      const agentsA = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+      const { ctx: ctxA, routes: routesA, effects: effectsA } = makeFakeCtx({
+        agents: agentsA,
+        dshHomePath: (p) => path.join(home, p),
+        ...offloadDoubles(storeRoot),
+      })
+      const pluginA = new DshWebhookDispatcherPlugin(ctxA, {
+        endpoints: [{ ...ENDPOINT_GH, sessionRetention: '24h' }],
+      })
+      fireDelivery({ routes: routesA })
+      await flush()
+      const sid = pluginA.status().endpoints[0].lastDelivery.sessionId
+      assert.equal((await readRetentionLog(logPath)).entries.length, 1)
+      disposeAll(effectsA)
+      // The framework store gains the settled session's log (the offload
+      // source).
+      mkdirSync(path.join(storeRoot, 'workspace', sid), { recursive: true })
+      writeFileSync(path.join(storeRoot, 'workspace', sid, 'session.v4.jsonl.zstd'), 'log')
+      // Instance B: the same home, the endpoint removed from the
+      // configuration (its units view is empty: the line's unit has
+      // vanished).
+      const { ctx: ctxB, effects: effectsB } = makeFakeCtx({
+        dshHomePath: (p) => path.join(home, p),
+        ...offloadDoubles(storeRoot),
+      })
+      const pluginB = new DshWebhookDispatcherPlugin(ctxB, { endpoints: [] })
+      assert.equal(pluginB.status().endpoints.length, 0)
+      await flush()
+      // B's first sweep round offloads the vanished unit's source without an
+      // age check and drains the line.
+      assert.ok(existsSync(path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR, sid)))
+      assert.ok(!existsSync(path.join(storeRoot, 'workspace', sid)))
+      assert.equal((await readRetentionLog(logPath)).entries.length, 0)
+      disposeAll(effectsB)
+      rmSync(home, { recursive: true, force: true })
+    })
+    // O9h: a host without the dshHomePath service loads the offload plane as
+    // unloaded (the plugin still dispatches; nothing is tracked).
+    await okA('O9h: a host without dshHomePath loads the offload plane as unloaded', async () => {
+      dropHandoverSlot()
+      const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+      const { ctx, routes, logs, effects } = makeFakeCtx({ agents })
+      const plugin = new DshWebhookDispatcherPlugin(ctx, {
+        endpoints: [{ ...ENDPOINT_GH, sessionRetention: '24h' }],
+      })
+      assert.equal(plugin['sweeper'], undefined)
+      const res = fakeRes()
+      const { req, deliver } = fakeReq({ method: 'POST', body: Buffer.from('ping'), headers: { 'content-type': 'text/plain' } })
+      routes.get('/gh').handler(req, res)
+      deliver()
+      await flush()
+      assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+      assert.ok(logs.warn.some((m) => m.includes('offload plane (retention + archive) is not loaded')))
+      assert.ok(logs.warn.some((m) => m.includes('no dshHomePath service; creating the session without a workspace')))
+      disposeAll(effects)
+    })
+    // O9i: the unit is ALIVE but its window is removed (the endpoint stays
+    // in the configuration without sessionRetention) the recorded line is
+    // retained (window 0), in contrast to O9g's vanished unit. Pins the
+    // constructor's units-map rule: a present endpoint without a window is a
+    // live unit of window 0, never an absent unit.
+    await okA('O9i: a present endpoint whose retention is removed keeps its recorded lines', async () => {
+      dropHandoverSlot()
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+      mkdirSync(storeRoot, { recursive: true })
+      const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+      // Instance A: the endpoint with a retention window dispatches (the line
+      // is written; the window is too wide to offload anything while A lives).
+      const agentsA = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+      const { ctx: ctxA, routes: routesA, effects: effectsA } = makeFakeCtx({
+        agents: agentsA,
+        dshHomePath: (p) => path.join(home, p),
+        ...offloadDoubles(storeRoot),
+      })
+      const pluginA = new DshWebhookDispatcherPlugin(ctxA, {
+        endpoints: [{ ...ENDPOINT_GH, sessionRetention: '24h' }],
+      })
+      fireDelivery({ routes: routesA })
+      await flush()
+      const sid = pluginA.status().endpoints[0].lastDelivery.sessionId
+      assert.equal((await readRetentionLog(logPath)).entries.length, 1)
+      disposeAll(effectsA)
+      // The framework store gains the settled session's log (the offload
+      // source).
+      mkdirSync(path.join(storeRoot, 'workspace', sid), { recursive: true })
+      writeFileSync(path.join(storeRoot, 'workspace', sid, 'session.v4.jsonl.zstd'), 'log')
+      // Instance B: the same home, the SAME endpoint kept but without the
+      // retention field (the unit is alive, its window is 0).
+      const { ctx: ctxB, effects: effectsB } = makeFakeCtx({
+        dshHomePath: (p) => path.join(home, p),
+        ...offloadDoubles(storeRoot),
+      })
+      const pluginB = new DshWebhookDispatcherPlugin(ctxB, { endpoints: [{ ...ENDPOINT_GH }] })
+      assert.equal(pluginB.status().endpoints.length, 1)
+      await flush()
+      // B's first sweep round retains the line (window 0): no archive, the
+      // store side untouched, the line intact.
+      assert.ok(!existsSync(path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR, sid)))
+      assert.ok(existsSync(path.join(storeRoot, 'workspace', sid)))
+      const kept = await readRetentionLog(logPath)
+      assert.equal(kept.entries.length, 1)
+      assert.equal(kept.entries[0].unit, 'gh')
+      disposeAll(effectsB)
+      rmSync(home, { recursive: true, force: true })
+    })
+  }
+
+  // -- O10: the lost-retention-log startup warning and the
+  //         append<->compaction mutex (the rewrite-window seam)
+  {
+    const mkLostLogCase = async (seed) => {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const archive = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR)
+        mkdirSync(storeRoot)
+        const { sweeper, warns } = makeSweeper(home, {
+          storeRoot,
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
+        })
+        seed(archive)
+        await sweeper.sweep()
+        await sweeper.sweep()
+        sweeper.dispose()
+        return warns.filter((m) => m.includes('retention log is missing'))
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+    const fresh = await mkLostLogCase(() => {})
+    ok('O10a: a fresh install (no archive, no log) stays silent', () => assert.equal(fresh.length, 0))
+    const lost = await mkLostLogCase((archive) => {
+      mkdirSync(path.join(archive, 'x'), { recursive: true })
+      writeFileSync(path.join(archive, 'x', 'session.v4.jsonl.zstd'), 'log')
+    })
+    ok('O10b: the lost log warns on the first round only (exactly once across rounds)', () => assert.equal(lost.length, 1))
+    // O10c: park the compaction rewrite between its temp write and its
+    // rename, append across the window, and prove the mutex serializes the
+    // append onto the post-rename file (the line survives).
+    {
+      const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
+      try {
+        const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
+        const archive = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR)
+        const logPath = path.join(home, OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE)
+        mkdirSync(storeRoot, { recursive: true })
+        mkdirSync(archive, { recursive: true })
+        // Four entries pre-archived (completed), one live (kept by the
+        // rewrite): the round rewrites the log down to the live line.
+        const liveId = 'm4'
+        for (let i = 0; i < 5; i++) {
+          const id = `m${i}`
+          makeSessionDir(storeRoot, id, CWD)
+          await appendRetentionEntry(logPath, { id, createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        }
+        for (let i = 0; i < 4; i++) {
+          renameSync(path.join(storeRoot, path.basename(CWD), `m${i}`), path.join(archive, `m${i}`))
+        }
+        let parked = false
+        let release
+        const gate = new Promise((r) => {
+          release = r
+        })
+        offload.rewriteBarrier.fn = async () => {
+          parked = true
+          await gate
+        }
+        const { sweeper } = makeSweeper(home, {
+          storeRoot,
+          units: mapUnit(),
+          now: () => T0,
+          services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry([liveId]) },
+        })
+        // A ref'd keep-alive handle: the parked rewrite and the queued
+        // append are pure promise chains, which alone would let the event
+        // loop empty and end the process mid-window.
+        const keepAlive = setInterval(() => {}, 50)
+        const run = sweeper.sweep()
+        while (!parked) await sleep(5)
+        // The append is created (queued behind the rewrite in the mutex) but
+        // not awaited yet: awaiting it before the release would deadlock,
+        // because the rewrite holds the mutex until its rename.
+        const pendingAppend = appendRetentionEntry(logPath, { id: 'mnew', createdAt: iso(T0 - 2 * W), unit: 'gh', cwd: CWD })
+        release()
+        await pendingAppend
+        const rep = await run
+        clearInterval(keepAlive)
+        const after = (await readRetentionLog(logPath)).entries
+        ok('O10c: an append parked in the rewrite window survives the rewrite (the write mutex)', () => {
+          assert.equal(rep.removedLines, 4)
+          assert.equal(after.length, 2)
+          assert.ok(after.some((e) => e.id === liveId))
+          assert.ok(after.some((e) => e.id === 'mnew'))
+        })
+        sweeper.dispose()
+      } finally {
+        offload.rewriteBarrier.fn = undefined
+        rmSync(home, { recursive: true, force: true })
+      }
+    }
+  }
+
+  // -- O11: the layout pin (the offload plane's home is the plugin home; the
+  //         store root is the framework session store, a SIBLING of the
+  //         plugin home, never under it; the constructor wires the layout
+  //         through the single helper). The pure-ASCII pin of the two
+  //         shipped plane files is covered by the strict ASCII gate at the
+  //         top of this file (it scans the whole src/ tree).
+  {
+    const lay = offloadLayout((seg) => path.join('/h', seg))
+    ok('O11a: the layout resolves the plugin-home files under the plugin home', () => {
+      assert.equal(lay.base, path.join('/h', OFFLOAD_HOME_BASE))
+      assert.equal(lay.archive, path.join('/h', OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR))
+      assert.equal(lay.log, path.join('/h', OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE))
+    })
+    ok('O11a: the store root is the framework store, a sibling of the plugin home', () => {
+      assert.equal(lay.storeRoot, path.join('/h', OFFLOAD_STORE_ROOT))
+      assert.ok(!lay.storeRoot.startsWith(lay.base + path.sep))
+    })
+    const pluginSrc = readFileSync(path.join(root, 'src', 'plugin.ts'), 'utf8')
+    ok('O11b: the constructor wires the sweeper home through offloadLayout', () => {
+      assert.ok(pluginSrc.includes('home: offloadLayout(resolveHome)'))
+    })
+    ok('O11b: the constructor never re-derives the store root under the plugin home', () => {
+      assert.ok(!pluginSrc.includes('OFFLOAD_STORE_ROOT'))
+    })
+  }
+}
+
 // selftest hygiene guard
 {
   // The shipped tree is self-contained and decoupled from any design
   // document: the same pattern set applies to the test source (everything
   // above this marker), every shipped source file, and the shipped
-  // skill/README. A reader needs only this package plus stable external
-  // authorities. This guard block is excluded from its own scan. The set
-  // is FROZEN: closed token families only; open-class failures belong to
-  // the review layer, not new patterns (2026-10-11 policy; details in the
-  // dsh_webhook entity file).
+  // skill/README (no doc pointers, no machine-specific paths, no line
+  // pointers, no review-round or version-round tags, no review-finding
+  // identifiers, no calendar dates, no CJK). A reader needs only this
+  // package plus stable external authorities. This guard block is excluded
+  // from its own scan. The set is FROZEN: closed token families only;
+  // open-class failures belong to the review layer, not new patterns.
   const patterns = [
-    ['design-doc section pointers', /design doc|design v\d|\u00a7\d/],
-    ['source line-number pointers', /L\d+[-\u2013\u2014]L?\d+/],
-    ['review-round wrappers', /round-?\d+|review #\d/],
-    ['project version-round tags', /\bv\d{2}\b/],
-    ['review finding identifiers', /\b[RWV]\d{1,2}\b/],
-    ['version-round identifiers', /\bv\d{2}[A-Za-z_]\w*/],
-    ['calendar dates', /20\d{2}-\d{2}-\d{2}/],
-    ['CJK characters', /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/],
+    ["design-doc section pointers", /design doc|design v\d|\u00a7\d/],
+    ["machine-specific paths", /\/workspace\//],
+    ["source line-number pointers", /L\d+[-\u2013\u2014]L?\d+/],
+    ["review-round wrappers", /round-?\d+|review #\d/],
+    ["project version-round tags", /\bv\d{2}\b/],
+    ["review finding identifiers", /\b[RWV]\d{1,2}\b/],
+    ["version-round identifiers", /\bv\d{2}[A-Za-z_]\w*/],
+    ["calendar dates", /20\d{2}-\d{2}-\d{2}/],
+    ["CJK characters", /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/],
   ]
-  // Skill files ship into any profile's agent context: they must be
+  // Skill files ship into any profile agent context: they must be
   // deployment-agnostic (no literal host:port addresses - the curl recipes
   // use the <host>:<port> placeholder, derived from the webhook status
   // ingress block). Applied to skill/ files only (the README may show
   // concrete example values in configuration snippets).
   const skillOnlyPatterns = [
-    ['literal host:port addresses', /(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])/],
+    ["literal host:port addresses", /(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d\.)/],
   ]
-  const raw = readFileSync(path.join(root, 'test', 'selftest.mjs'), 'utf8')
-  const sources = { 'test/selftest.mjs': raw.slice(0, raw.indexOf('// selftest hygiene guard')) }
-  for (const f of readdirSync(path.join(root, 'src'))) {
-    if (!f.endsWith('.ts')) continue
-    sources[`src/${f}`] = readFileSync(path.join(root, 'src', f), 'utf8')
+  const raw = readFileSync(path.join(root, "test", "selftest.mjs"), "utf8")
+  const sources = { "test/selftest.mjs": raw.slice(0, raw.indexOf("// selftest hygiene guard")) }
+  for (const f of readdirSync(path.join(root, "src"))) {
+    if (!f.endsWith(".ts")) continue
+    sources["src/" + f] = readFileSync(path.join(root, "src", f), "utf8")
   }
-  for (const f of readdirSync(path.join(root, 'skill', 'dsh-webhook-dispatcher'))) {
-    sources[`skill/dsh-webhook-dispatcher/${f}`] = readFileSync(path.join(root, 'skill', 'dsh-webhook-dispatcher', f), 'utf8')
+  for (const f of readdirSync(path.join(root, "skill", "dsh-webhook-dispatcher"))) {
+    sources["skill/dsh-webhook-dispatcher/" + f] = readFileSync(path.join(root, "skill", "dsh-webhook-dispatcher", f), "utf8")
   }
-  sources['README.md'] = readFileSync(path.join(root, 'README.md'), 'utf8')
+  sources["README.md"] = readFileSync(path.join(root, "README.md"), "utf8")
   for (const [file, code] of Object.entries(sources)) {
     for (const [label, re] of patterns) {
-      ok(`hygiene ${file}: no ${label}`, () => {
-        if (re.test(code)) throw new Error(`pattern matched: ${re}`)
+      ok("hygiene " + file + ": no " + label, () => {
+        if (re.test(code)) throw new Error("pattern matched: " + re)
       })
     }
-    if (file.startsWith('skill/')) {
+    if (file.startsWith("skill/")) {
       for (const [label, re] of skillOnlyPatterns) {
-        ok(`hygiene ${file}: no ${label}`, () => {
-          if (re.test(code)) throw new Error(`pattern matched: ${re}`)
+        ok("hygiene " + file + ": no " + label, () => {
+          if (re.test(code)) throw new Error("pattern matched: " + re)
         })
       }
     }

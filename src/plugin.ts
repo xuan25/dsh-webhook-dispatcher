@@ -13,8 +13,10 @@
 // effects, the dispose stash effect); the instance `async *[Service.init]()`
 // is a no-op generator - the shape follows the dsh-timer convention, with
 // no long-lived start step: route registrations and the three
-// tool/skill/prompt registrations are effect disposers, and the only other
-// timers (the 300 s create deadlines) are host timers owned per dispatch.
+// tool/skill/prompt registrations are effect disposers, the offload
+// sweeper's 60 s sweep is a plugin-owned timer armed in the constructor and
+// stopped by the dispose cleanup, and the 300 s create deadlines are host
+// timers owned per dispatch.
 // A valid-but-failing registration (e.g. a duplicate route) throws at effect
 // activation and fails the entry loudly.
 //
@@ -35,6 +37,7 @@
 // auth env presence fail-closed).
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile } from 'node:fs/promises'
+import path from 'node:path'
 import { parse as parseYaml } from 'yaml'
 import { Service, type Context, type Logger } from '@deepseek-ai/cordis'
 import type { AgentHandle, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
@@ -53,6 +56,8 @@ import type {
   StatusResult,
 } from './types.js'
 import { EndpointPipeline, type PipelineDeps, type SpawnRequest, type SpawnResult } from './pipeline.js'
+import { OffloadSweeper, offloadLayout } from './offload.js'
+import { parseOffloadBatch, parseWindowMs } from './retention.js'
 import { createHandler } from './handler.js'
 import { registerTool } from './tool.js'
 import { registerSkill } from './skill.js'
@@ -142,6 +147,10 @@ export class DshWebhookDispatcherPlugin extends Service {
   private readonly web: WebServer
   private readonly cfg: ParsedConfig
   private readonly pipelines = new Map<string, EndpointPipeline>()
+  /** Offload sweeper (undefined = the offload plane is not loaded: the host has no dshHomePath service). */
+  private sweeper: OffloadSweeper | undefined
+  /** Session ids dispatched but not yet settled (the offload liveness gate; onSettled clears them). */
+  private readonly offloadInflight = new Set<string>()
 
   constructor(ctx: Context, config: DeliveredConfig | undefined) {
     super(ctx, PLUGIN_NAME)
@@ -200,9 +209,65 @@ export class DshWebhookDispatcherPlugin extends Service {
       order: 3000,
       text:
         'Webhook deliveries are handled by the dsh-webhook-dispatcher plugin (webhook tool, status ' +
-        'verb); see the dsh-webhook-dispatcher skill for the endpoint configuration reference and ' +
-        'trigger session semantics.',
+        'verb); endpoints can set sessionRetention for automatic offload of settled trigger sessions ' +
+        '(retention window syntax in the dsh-webhook-dispatcher skill); see the dsh-webhook-dispatcher ' +
+        'skill for the endpoint configuration reference and trigger session semantics.',
     })
+
+    // The offload plane (session retention + archive): the layout = the
+    // retention log and the archive under the plugin home, the store root =
+    // the framework session store (a SIBLING of the plugin home). dshHomePath
+    // is a soft-read service: a host without it degrades the plane to
+    // unloaded (the plugin's dshHomePath soft-read contract), it never stops
+    // the plugin. The endpoint window view is a per-instance snapshot: a
+    // configuration change rebuilds the plugin (the new instance carries the
+    // new view); an endpoint removed from the configuration is a vanished
+    // unit (the non-retention semantics apply to its pending lines), while a
+    // present endpoint without a window is a live unit of window 0 (retain).
+    let resolveHome: ((segment: string) => string) | undefined
+    try {
+      const h = this.hostCtx.get('dshHomePath')
+      resolveHome = typeof h === 'function' ? (h as (segment: string) => string) : undefined
+    } catch {
+      resolveHome = undefined
+    }
+    if (resolveHome === undefined) {
+      this.log.warn(`${PLUGIN_NAME}: no dshHomePath service; the offload plane (retention + archive) is not loaded`)
+    } else {
+      const units = new Map<string, number>()
+      for (const endpoint of this.cfg.endpoints) {
+        if (endpoint.sessionRetention === undefined || endpoint.sessionRetention === '') {
+          // No window configured (or an empty one): the endpoint is a LIVE
+          // unit whose window is 0 (retain); its recorded lines stay, and a
+          // later window re-open re-manages them. Only the endpoints ABSENT
+          // from the configuration are vanished units.
+          units.set(endpoint.id, 0)
+          continue
+        }
+        const parsed = parseWindowMs(endpoint.sessionRetention)
+        if (parsed.ok) {
+          units.set(endpoint.id, parsed.ms)
+          continue
+        }
+        // An invalid window never rejects the endpoint boot (the schema
+        // checks the type only): the plane treats it as 0 (retain) and says
+        // so once, at load time.
+        units.set(endpoint.id, 0)
+        this.log.warn(
+          `${PLUGIN_NAME} endpoint "${endpoint.id}": invalid sessionRetention value "${endpoint.sessionRetention}" ` +
+            `(${parsed.reason}); the offload window is treated as 0 (retain)`,
+        )
+      }
+      this.sweeper = new OffloadSweeper({
+        ctx: this.hostCtx,
+        logger: this.log,
+        home: offloadLayout(resolveHome),
+        units: () => units,
+        inflight: this.offloadInflight,
+        cap: parseOffloadBatch(process.env.DSH_WEBHOOK_OFFLOAD_BATCH, (m) => this.log.warn(`${PLUGIN_NAME}: ${m}`)),
+      })
+      this.sweeper.start()
+    }
 
     // Dispose stash: the pipeline state travels to the successor through the
     // module-level handover slot. Pipelines are flagged disposed BEFORE the
@@ -211,6 +276,7 @@ export class DshWebhookDispatcherPlugin extends Service {
     // flight sessions are never cancelled.
     ctx.effect(
       () => () => {
+        this.sweeper?.dispose()
         for (const pipeline of this.pipelines.values()) pipeline.disposed = true
         const pipelines: Record<string, PipelineState> = {}
         for (const [id, pipeline] of this.pipelines) {
@@ -279,7 +345,8 @@ export class DshWebhookDispatcherPlugin extends Service {
    * the agents service, resolve the deployment-default preset and the model
    * selection ladder (the endpoint's model, when set, overlays the model
    * field of the resolved base), prepare the session workspace (the
-   * endpoint cwd, or $DSH_HOME/dsh-webhook-dispatcher when unset), create
+   * endpoint cwd, or the shared plugin workspace under
+   * $DSH_HOME/dsh-webhook-dispatcher when unset), create
    * the session under the 300 s bounded deadline (late resolves are
    * cancelled + disposed), apply the per-session sandbox override when
    * configured, deliver the prompt as the first turn, settle on the
@@ -380,68 +447,82 @@ export class DshWebhookDispatcherPlugin extends Service {
     }
     const created = createResult.handle
     req.onSessionCreated?.(sid)
+    // Offload write gate: the session exists and its id is resolved. Mark
+    // it in-flight (the sweep must not archive it); when the endpoint's
+    // retention window is set and the workspace resolved, record the
+    // retention line (a workspace-less session is never tracked and never
+    // deleted).
+    this.sweeper?.onDispatch(endpoint.id, sid, workspace)
 
-    // Per-session sandbox override (endpoint config: absent = the session
-    // default). Soft: a set failure warns, the session keeps its default.
-    if (endpoint.sandbox !== undefined) {
+    try {
+      // Per-session sandbox override (endpoint config: absent = the session
+      // default). Soft: a set failure warns, the session keeps its default.
+      if (endpoint.sandbox !== undefined) {
+        try {
+          setSandboxMode(created.agent.session, endpoint.sandbox)
+        } catch (err) {
+          this.log.warn(`${PLUGIN_NAME} ${tag}: sandbox mode "${endpoint.sandbox}" could not be set: ${errMsg(err)}`)
+        }
+      }
+
+      // The first turn: the delivery prompt.
+      const msg = createUserMessage({
+        content: [{ type: 'text', text: req.prompt }],
+        source: { kind: 'user' },
+      })
+      let followupError: string | undefined
       try {
-        setSandboxMode(created.agent.session, endpoint.sandbox)
+        // The typed followup returns void; at runtime some drivers return a
+        // settle promise - keep the dsh-email defensive attach.
+        const r = created.agent.followup(msg) as unknown
+        if (r !== null && typeof r === 'object' && typeof (r as { catch?: unknown }).catch === 'function') {
+          ;(r as { catch: (fn: (err: unknown) => void) => void }).catch((err) => {
+            followupError = errMsg(err)
+          })
+        }
       } catch (err) {
-        this.log.warn(`${PLUGIN_NAME} ${tag}: sandbox mode "${endpoint.sandbox}" could not be set: ${errMsg(err)}`)
+        followupError = errMsg(err)
       }
-    }
 
-    // The first turn: the delivery prompt.
-    const msg = createUserMessage({
-      content: [{ type: 'text', text: req.prompt }],
-      source: { kind: 'user' },
-    })
-    let followupError: string | undefined
-    try {
-      // The typed followup returns void; at runtime some drivers return a
-      // settle promise - keep the dsh-email defensive attach.
-      const r = created.agent.followup(msg) as unknown
-      if (r !== null && typeof r === 'object' && typeof (r as { catch?: unknown }).catch === 'function') {
-        ;(r as { catch: (fn: (err: unknown) => void) => void }).catch((err) => {
-          followupError = errMsg(err)
-        })
+      try {
+        await created.agent.whenIdle()
+      } catch {
+        /* whenIdle is not expected to reject; ignore */
       }
-    } catch (err) {
-      followupError = errMsg(err)
-    }
 
-    try {
-      await created.agent.whenIdle()
-    } catch {
-      /* whenIdle is not expected to reject; ignore */
-    }
+      let endEvent: TurnEndEvent | null = null
+      try {
+        endEvent = lastTurnEnd(created.agent.session.snapshotEvents())
+      } catch {
+        endEvent = null
+      }
+      const kind = endEvent ? reasonKind(endEvent.data?.reason) : null
 
-    let endEvent: TurnEndEvent | null = null
-    try {
-      endEvent = lastTurnEnd(created.agent.session.snapshotEvents())
-    } catch {
-      endEvent = null
+      let result: SpawnResult
+      if (kind === 'completed' || kind === 'blocked' || kind === 'max-tokens') {
+        result = { ok: true, sessionId: sid }
+      } else if (endEvent !== null) {
+        const detail = turnErrorMessage(endEvent.data?.reason)
+        result = { ok: false, kind: 'failed', detail: detail || `turn ended with reason ${kind}`, sessionId: sid }
+      } else if (followupError !== undefined) {
+        result = { ok: false, kind: 'failed', detail: followupError, sessionId: sid }
+      } else {
+        this.log.warn(`${PLUGIN_NAME} ${tag}: trigger session for delivery "${req.deliveryId}" ended without a turn/end event; falling back to ok`)
+        result = { ok: true, sessionId: sid }
+      }
+      try {
+        await created.dispose()
+      } catch {
+        /* already disposed */
+      }
+      return result
+    } finally {
+      // The trigger session is settled (normally, or through an unguarded
+      // throw in the post-create block): the offload in-flight mark is
+      // cleared either way, so no session is pinned live for the process
+      // lifetime by a failed spawn.
+      this.sweeper?.onSettled(sid)
     }
-    const kind = endEvent ? reasonKind(endEvent.data?.reason) : null
-
-    let result: SpawnResult
-    if (kind === 'completed' || kind === 'blocked' || kind === 'max-tokens') {
-      result = { ok: true, sessionId: sid }
-    } else if (endEvent !== null) {
-      const detail = turnErrorMessage(endEvent.data?.reason)
-      result = { ok: false, kind: 'failed', detail: detail || `turn ended with reason ${kind}`, sessionId: sid }
-    } else if (followupError !== undefined) {
-      result = { ok: false, kind: 'failed', detail: followupError, sessionId: sid }
-    } else {
-      this.log.warn(`${PLUGIN_NAME} ${tag}: trigger session for delivery "${req.deliveryId}" ended without a turn/end event; falling back to ok`)
-      result = { ok: true, sessionId: sid }
-    }
-    try {
-      await created.dispose()
-    } catch {
-      /* already disposed */
-    }
-    return result
   }
 
   /** The deployment-default preset of the trigger session (no per-endpoint preset knob; missing service = baseline, resolution failure = warn + baseline). */
@@ -531,9 +612,10 @@ export class DshWebhookDispatcherPlugin extends Service {
 
   /**
    * The trigger session workspace: the endpoint cwd when configured, else
-   * $DSH_HOME/dsh-webhook-dispatcher (the shared plugin directory).
-   * Every failure is soft: without the dshHomePath service (or on a mkdir
-   * failure) the dispatch degrades to a workspace-less create and warns.
+   * the shared plugin workspace (the workspace/ subdirectory of
+   * $DSH_HOME/dsh-webhook-dispatcher). Every failure is soft: without the
+   * dshHomePath service (or on a mkdir failure) the dispatch degrades to a
+   * workspace-less create and warns.
    */
   private async resolveWorkspace(endpoint: EndpointConfig): Promise<string | undefined> {
     let dir: string | undefined
@@ -551,7 +633,7 @@ export class DshWebhookDispatcherPlugin extends Service {
         return undefined
       }
       try {
-        dir = (dshHomePath as (p: string) => string)(PLUGIN_NAME)
+        dir = path.join((dshHomePath as (p: string) => string)(PLUGIN_NAME), 'workspace')
       } catch {
         this.log.warn(`${PLUGIN_NAME} endpoint "${endpoint.id}": dshHomePath failed; creating the session without a workspace`)
         return undefined
