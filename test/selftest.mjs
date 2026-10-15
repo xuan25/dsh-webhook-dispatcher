@@ -1561,25 +1561,26 @@ console.log('offload plane')
   }
 
   // A capturing minimal ctx for the component tests: ctx.get routes to the
-  // given services (soft read), the logger records warn/info/error lines.
+  // given services (soft read), the logger records warn/info/error/debug lines.
   const compCtx = (services = {}) => {
     const warns = []
     const infos = []
+    const debugs = []
     const mkLog = () => ({
       warn: (m) => warns.push(m),
       error: (m) => warns.push(m),
       info: (m) => infos.push(m),
-      debug: () => {},
+      debug: (m) => debugs.push(m),
     })
     const ctx = { get: (name) => (name in services ? services[name] : undefined), logger: mkLog }
-    return { ctx, warns, infos }
+    return { ctx, warns, infos, debugs }
   }
 
   // Build an OffloadSweeper rooted at a temp harness home (all the optional
   // test seams default to the production behavior).
   const makeSweeper = (home, opts = {}) => {
     const services = opts.services ?? {}
-    const { ctx, warns, infos } = compCtx(services)
+    const { ctx, warns, infos, debugs } = compCtx(services)
     const storeRoot = opts.storeRoot ?? path.join(home, OFFLOAD_STORE_ROOT)
     const pluginHome = path.join(home, OFFLOAD_HOME_BASE)
     const sweeper = new OffloadSweeper({
@@ -1598,7 +1599,7 @@ console.log('offload plane')
       devOf: opts.devOf,
       move: opts.move,
     })
-    return { sweeper, warns, infos, storeRoot }
+    return { sweeper, warns, infos, debugs, storeRoot }
   }
 
   // One round of fixtures: setup builds the home (store dir, log lines,
@@ -2623,13 +2624,15 @@ console.log('offload plane')
     try {
       const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
       mkdirSync(storeRoot, { recursive: true })
-      const { sweeper, infos } = makeSweeper(home, {
+      const { sweeper, debugs } = makeSweeper(home, {
         storeRoot,
         services: { sessionPersistence: makeSpService(storeRoot), sessions: makeRegistry() },
       })
       sweeper.start()
       await flush()
-      ok('arming-a: start arms an immediate first round', () => assert.ok(infos.some((m) => m.includes('sweep done'))))
+      ok('arming-a: start arms an immediate first round (the no-op round logs at debug)', () =>
+        assert.ok(debugs.some((m) => m.includes('sweep done'))),
+      )
       sweeper.start() // re-arming is a no-op
       sweeper.dispose()
       ok('arming-a: dispose stops the timer without error', () => true)
