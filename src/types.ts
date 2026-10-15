@@ -31,6 +31,11 @@ export interface EndpointConfig {
   sandbox?: SandboxMode
   /** Trigger session model (absent: the default selection ladder). */
   model?: string
+  /** Reasoning effort of the trigger session (a member of the closed level
+   * set, REASONING_EFFORTS in config.ts; absent: the framework provider
+   * default; the framework re-checks the per-model support of the route at
+   * first request). */
+  reasoningEffort?: string
   /** Max in-flight trigger sessions (default 1). */
   maxConcurrent: number
   /** Max queued deliveries (default 100). */
@@ -53,6 +58,7 @@ export interface DeliveredEndpoint {
   auth?: string
   sandbox?: SandboxMode
   model?: string
+  reasoningEffort?: string
   maxConcurrent?: number
   maxQueue?: number
   maxBodyBytes?: number

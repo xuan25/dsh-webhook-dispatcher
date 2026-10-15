@@ -43,7 +43,7 @@ import { parse as parseYaml } from 'yaml'
 import { Service, type Context, type Logger } from '@deepseek-ai/cordis'
 import type { AgentHandle, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
 import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { errMsg, PLUGIN_NAME, RING_CAP } from './util.js'
@@ -563,20 +563,27 @@ export class DshWebhookDispatcherPlugin extends Service {
    * sources 1 and 2 are read under one guard, so a throw in either skips
    * to source 3),
    * overlaid with the endpoint's model when configured (the model field
-   * only; a base provider is kept). When no source resolves and the
-   * endpoint sets no model, no route is passed and the framework's own
-   * no-route rejection is surfaced at settlement (port of the dsh-email /
-   * dsh-timer ladder).
+   * only; a base provider is kept). The reasoning effort: the endpoint's
+   * reasoningEffort when set (validated at boot against the closed level
+   * set), otherwise the framework's provider default. When no source
+   * resolves and the endpoint sets no model and no reasoning effort, no
+   * route is passed and the framework's own no-route rejection is surfaced
+   * at settlement (port of the dsh-email / dsh-timer ladder).
    */
   private async resolveAgentOptions(endpoint: EndpointConfig): Promise<CreateAgentOptions['agentOptions']> {
     const base = await this.readDefaultModelSelection()
-    const options: { provider?: string; model?: string } = {}
+    const options: { provider?: string; model?: string; reasoningEffort?: ReasoningEffortId } = {}
     if (base !== undefined) {
       options.provider = base.provider
       options.model = base.model
     }
     if (endpoint.model !== undefined && endpoint.model !== '') {
       options.model = endpoint.model
+    }
+    // The framework brands the effort (a plain string at the config boundary;
+    // the closed set was validated at boot).
+    if (endpoint.reasoningEffort !== undefined) {
+      options.reasoningEffort = ReasoningEffortId(endpoint.reasoningEffort)
     }
     return Object.keys(options).length > 0 ? options : undefined
   }

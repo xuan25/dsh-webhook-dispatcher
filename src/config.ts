@@ -19,6 +19,16 @@ import {
 } from './util.js'
 import type { DeliveredConfig, EndpointConfig, ParsedConfig, SandboxMode } from './types.js'
 
+/**
+ * The closed reasoning-effort level set, mirrored from the framework's
+ * THINKING_LEVELS (dsh-llm-pi-ai): the framework re-checks per-model support
+ * at first request (a level the model does not declare = a turn error). The
+ * same seven levels are validated in sync by the other session-producing
+ * plugins (dsh-email, dsh-timer); no shared package: the three copies stay in
+ * lock step, the spec in the repo's reports directory is the reference.
+ */
+export const REASONING_EFFORTS: readonly string[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
 /** The declared per-endpoint fields (the validation message reference). */
 const ENDPOINT_FIELDS = {
   id: 'the endpoint id (config key / pipeline key / handover key)',
@@ -33,6 +43,7 @@ const ENDPOINT_FIELDS = {
   maxQueue: 'max queued deliveries (default 100)',
   maxBodyBytes: 'max request body bytes (default 262144)',
   sessionRetention: 'the session retention window for automatic offload of settled trigger sessions (empty: no offload)',
+  reasoningEffort: `the reasoning effort of the trigger session (a member of the closed level set ${REASONING_EFFORTS.join(' | ')}; empty: the framework provider default)`,
 } as const
 
 /** The label of the per-endpoint schema in validation messages. */
@@ -97,6 +108,9 @@ export const ENDPOINT_CONFIG = rejectUnknownKeys(
     maxQueue: integerField(0, 100000, ENDPOINT_FIELDS.maxQueue),
     maxBodyBytes: integerField(1, 10485760, ENDPOINT_FIELDS.maxBodyBytes),
     sessionRetention: Schema.string().description(ENDPOINT_FIELDS.sessionRetention),
+    reasoningEffort: Schema.string()
+      .pattern(new RegExp(`^(${REASONING_EFFORTS.join('|')})$`))
+      .description(ENDPOINT_FIELDS.reasoningEffort),
   }),
   ENDPOINT_CONFIG_LABEL,
 )
@@ -152,10 +166,12 @@ export const CONFIG_FIELD_TO_ENV = {
   maxQueue: 'MAX_QUEUE',
   maxBodyBytes: 'MAX_BODY_BYTES',
   sessionRetention: 'SESSION_RETENTION',
+  reasoningEffort: 'REASONING_EFFORT',
 } as const
 
 /** The recognized suffixes, longest first (the match is deterministic). */
 const ENV_FIELD_SUFFIXES: readonly string[] = [
+  'REASONING_EFFORT',
   'SESSION_RETENTION',
   'MAX_BODY_BYTES',
   'MAX_CONCURRENT',
@@ -272,7 +288,10 @@ function parseEndpointEnv(env: Record<string, string | undefined>, warn: (msg: s
  * - `sessionRetention` is a raw retention window string: the boot checks its
  *   type only (any non-empty string passes), so an invalid window never
  *   rejects the endpoint; the offload plane warns and treats the window as 0
- *   (retain) when it loads.
+ *   (retain) when it loads,
+ * - a present `reasoningEffort` must be a member of the closed level set
+ *   (REASONING_EFFORTS; the framework re-checks the per-model support of the
+ *   route at first request) - an outside value rejects the boot.
  * An empty value of the other optional fields (policy / cwd / auth / model /
  * sessionRetention) behaves as absent.
  * @param raw the merged raw declarations (config layer over env).
@@ -338,6 +357,16 @@ function buildEndpoints(raw: RawEndpoint[], env: Record<string, string | undefin
       sandbox = f.SANDBOX as SandboxMode
     }
     const model = f.MODEL !== undefined && f.MODEL !== '' ? f.MODEL : undefined
+    let reasoningEffort: string | undefined
+    if (f.REASONING_EFFORT !== undefined && f.REASONING_EFFORT !== '') {
+      if (!REASONING_EFFORTS.includes(f.REASONING_EFFORT)) {
+        throw new Error(
+          `${PLUGIN_NAME} config: endpoint "${e.id}" reasoningEffort "${f.REASONING_EFFORT}" is not a valid level ` +
+            `(expected: ${REASONING_EFFORTS.join(' | ')}) (variable ${e.vars.REASONING_EFFORT})`,
+        )
+      }
+      reasoningEffort = f.REASONING_EFFORT
+    }
     const int = (
       field: 'maxConcurrent' | 'maxQueue' | 'maxBodyBytes',
       suffix: string,
@@ -381,6 +410,7 @@ function buildEndpoints(raw: RawEndpoint[], env: Record<string, string | undefin
       maxQueue: int('maxQueue', 'MAX_QUEUE', 0, 100000, ENDPOINT_DEFAULTS.maxQueue),
       maxBodyBytes: int('maxBodyBytes', 'MAX_BODY_BYTES', 1, 10485760, ENDPOINT_DEFAULTS.maxBodyBytes),
       ...(sessionRetention !== undefined ? { sessionRetention } : {}),
+      ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     }
   })
   return { endpoints }

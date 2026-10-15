@@ -59,6 +59,7 @@ guard); a duplicate endpoint `id` or `path` fails startup loudly.
 | `auth` | string | `""` | the ENV VAR NAME holding the expected token value (the value itself is read from the process env at request time; it is never stored or logged). Empty = open endpoint. A name that is unset or empty at startup fails startup fail-closed (no route registered, loud error naming the endpoint and the env name) |
 | `sandbox` | enum | absent | `read-only` \| `workspace-write` \| `danger-full-access`; applied to the trigger session via the per-session override (absent = the session default). The permission preset ids are 1:1 with these modes |
 | `model` | string | absent | the trigger-session model; overlays the model field of the deployment default selection ladder (agentDefaultModel service -> settings section -> `$DSH_HOME/settings.yaml`); absent = the ladder result (no route = the framework no-route rejection, surfaced as a failed session) |
+| `reasoningEffort` | string | absent | the trigger-session reasoning effort; a member of the closed level set `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` (validated at boot - an outside value rejects the boot on both channels, and the empty string is rejected on the config layer while an empty env value behaves as absent; the framework re-checks the per-model support of the route at first request). Absent = the framework's provider default |
 | `maxConcurrent` | int | `1` | 1..1000; the in-flight trigger-session slots of this endpoint (held from dispatch start until the session settles) |
 | `maxQueue` | int | `100` | 0..100000; the FIFO queue behind the slots; `0` = no queue (a delivery that cannot take a slot is immediately 429) |
 | `maxBodyBytes` | int | `262144` | 1..10485760 (10 MiB); the POST body budget (GET bodies are impossible; an empty POST body is a no-content delivery, not an error) |
@@ -77,6 +78,7 @@ declared one endpoint per id:
 | `auth` | `AUTH` |
 | `sandbox` | `SANDBOX` |
 | `model` | `MODEL` |
+| `reasoningEffort` | `REASONING_EFFORT` |
 | `maxConcurrent` | `MAX_CONCURRENT` |
 | `maxQueue` | `MAX_QUEUE` |
 | `maxBodyBytes` | `MAX_BODY_BYTES` |
@@ -91,9 +93,10 @@ declared one endpoint per id:
   `MAX_QUEUE` - the segment `CI_RUN` is the id, not the field)
 - Both channels share one validator, so every field rule above (route
   charset, the framework deny-list, `id`/`path` uniqueness across both
-  channels, the `sandbox` enum, the integer bounds, the fail-closed `auth`
-  presence) applies to the env channel exactly as to the config layer; a
-  violation fails the boot and the endpoint routes are never registered
+  channels, the `sandbox` enum, the `reasoningEffort` closed level set, the
+  integer bounds, the fail-closed `auth` presence) applies to the env channel
+  exactly as to the config layer; a violation fails the boot and the endpoint
+  routes are never registered
 - An empty value of the optional fields (`name` excepted: it must be
   non-empty when delivered) behaves as absent; the `auth` name is carried,
   its value read from the process env at boot and at request time
@@ -179,8 +182,10 @@ Session mechanics (for debugging, not for acting on):
 
 - The session is created on the host `agents` service with an explicit
   `cwd` (the endpoint `cwd`, or the shared plugin directory) and the
-  deployment-default preset; the per-endpoint `sandbox` and `model` are
-  applied as a per-session override and an options overlay respectively.
+  deployment-default preset; the per-endpoint `sandbox` is applied as a
+  per-session override, and the per-endpoint `model` and `reasoningEffort`
+  ride the create options overlay (each absent field is omitted, so the
+  framework provider default stands).
 - Session creation is bounded by a 300 s deadline; a late create is
   cancelled and disposed (a `create_failed` outcome).
 - Settlement classifies the final `turn/end`: `completed` / `blocked` /

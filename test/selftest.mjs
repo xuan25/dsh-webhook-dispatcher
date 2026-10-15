@@ -25,6 +25,7 @@ const {
   stashHandover,
   takeHandoverSlot,
 } = mod
+const { REASONING_EFFORTS } = await import(path.join(root, 'lib', 'config.js'))
 
 let checks = 0
 function ok(name, fn) {
@@ -137,6 +138,7 @@ ok('explicit values beat the defaults', () => {
           auth: 'T',
           sandbox: 'read-only',
           model: 'some/model',
+          reasoningEffort: 'low',
           maxConcurrent: 4,
           maxQueue: 0,
           maxBodyBytes: 1024,
@@ -154,6 +156,7 @@ ok('explicit values beat the defaults', () => {
     auth: 'T',
     sandbox: 'read-only',
     model: 'some/model',
+    reasoningEffort: 'low',
     maxConcurrent: 4,
     maxQueue: 0,
     maxBodyBytes: 1024,
@@ -169,6 +172,8 @@ for (const [label, endpoint] of [
   ['empty path', { id: 'gh', path: '' }],
   ['path with a space', { id: 'gh', path: '/gh x' }],
   ['unknown sandbox mode', { id: 'gh', path: '/gh', sandbox: 'full' }],
+  ['reasoningEffort outside the closed set', { id: 'gh', path: '/gh', reasoningEffort: 'banana' }],
+  ['empty reasoningEffort (the closed set allows no empty member)', { id: 'gh', path: '/gh', reasoningEffort: '' }],
   ['maxConcurrent below 1', { id: 'gh', path: '/gh', maxConcurrent: 0 }],
   ['maxConcurrent above the bound', { id: 'gh', path: '/gh', maxConcurrent: 1001 }],
   ['maxConcurrent fractional', { id: 'gh', path: '/gh', maxConcurrent: 2.5 }],
@@ -305,12 +310,13 @@ ok('two channels, two endpoints: the union of ids', () => {
 })
 ok('empty optional env values behave as absent', () => {
   const cfg = foldConfig(
-    { DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_SANDBOX: '', DSH_WEBHOOK_GH_MODEL: '' },
+    { DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_SANDBOX: '', DSH_WEBHOOK_GH_MODEL: '', DSH_WEBHOOK_GH_REASONING_EFFORT: '' },
     undefined,
     () => {},
   )
   assert.equal('sandbox' in cfg.endpoints[0], false)
   assert.equal('model' in cfg.endpoints[0], false)
+  assert.equal('reasoningEffort' in cfg.endpoints[0], false)
 })
 throws('an env declaration without PATH rejects the boot', () =>
   foldConfig({ DSH_WEBHOOK_GH_POLICY: 'x' }, undefined, () => {}),
@@ -333,6 +339,24 @@ throws('an env path colliding with a config-layer path', () =>
 )
 throws('an env sandbox outside the declared modes', () =>
   foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_SANDBOX: 'full' }, undefined, () => {}),
+)
+ok('a valid env reasoningEffort is carried', () => {
+  const cfg = foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_REASONING_EFFORT: 'off' }, undefined, () => {})
+  assert.equal(cfg.endpoints[0].reasoningEffort, 'off')
+})
+ok('the env channel accepts every level of the closed set', () => {
+  for (const level of REASONING_EFFORTS) {
+    const cfg = foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_REASONING_EFFORT: level }, undefined, () => {})
+    assert.equal(cfg.endpoints[0].reasoningEffort, level)
+  }
+})
+ok('the config channel accepts every level of the closed set', () => {
+  for (const level of REASONING_EFFORTS) {
+    validate({ endpoints: [{ id: 'gh', path: '/gh', reasoningEffort: level }] })
+  }
+})
+throws('an env reasoningEffort outside the closed set', () =>
+  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_REASONING_EFFORT: 'banana' }, undefined, () => {}),
 )
 throws('an env integer outside the shape (MAX_QUEUE=abc)', () =>
   foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_MAX_QUEUE: 'abc' }, undefined, () => {}),
@@ -1340,6 +1364,58 @@ await okA('plugin: with no model source and no endpoint model, no route is passe
   await flush()
   assert.equal('agentOptions' in agents.calls[0], false)
   assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+})
+
+// Reasoning effort (isomorphic to the other session-producing plugins): a set
+// level passes through to the create's agentOptions alongside the model route
+// (alone when no route resolves); unset with no route source = the
+// agentOptions key is omitted entirely.
+await okA('plugin: a set reasoning effort with no model source is carried alone', async () => {
+  dropHandoverSlot()
+  const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+  const { ctx, routes } = makeFakeCtx({ agents, dshHomePath: (p) => path.join(wsTmp, p) })
+  const plugin = new DshWebhookDispatcherPlugin(ctx, { endpoints: [{ ...ENDPOINT_GH, reasoningEffort: 'low' }] })
+  routes.get('/gh').handler(fakeReq({ method: 'GET' }).req, fakeRes())
+  await flush()
+  assert.deepEqual(agents.calls[0].agentOptions, { reasoningEffort: 'low' })
+  assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+})
+await okA('plugin: a set reasoning effort rides alongside the default selection', async () => {
+  dropHandoverSlot()
+  const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+  const { ctx, routes } = makeFakeCtx({
+    agents,
+    agentDefaultModel: { currentSelection: () => ({ provider: 'p1', model: 'm1' }) },
+    dshHomePath: (p) => path.join(wsTmp, p),
+  })
+  const plugin = new DshWebhookDispatcherPlugin(ctx, { endpoints: [{ ...ENDPOINT_GH, reasoningEffort: 'off' }] })
+  routes.get('/gh').handler(fakeReq({ method: 'GET' }).req, fakeRes())
+  await flush()
+  assert.deepEqual(agents.calls[0].agentOptions, { provider: 'p1', model: 'm1', reasoningEffort: 'off' })
+  assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+})
+await okA('plugin: a set reasoning effort rides alongside the endpoint model', async () => {
+  dropHandoverSlot()
+  const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+  const { ctx, routes } = makeFakeCtx({
+    agents,
+    agentDefaultModel: { currentSelection: () => ({ provider: 'p1', model: 'm1' }) },
+    dshHomePath: (p) => path.join(wsTmp, p),
+  })
+  const plugin = new DshWebhookDispatcherPlugin(ctx, { endpoints: [{ ...ENDPOINT_GH, model: 'em', reasoningEffort: 'max' }] })
+  routes.get('/gh').handler(fakeReq({ method: 'GET' }).req, fakeRes())
+  await flush()
+  assert.deepEqual(agents.calls[0].agentOptions, { provider: 'p1', model: 'em', reasoningEffort: 'max' })
+  assert.equal(plugin.status().endpoints[0].lastDelivery.outcome, 'ok')
+})
+await okA('plugin: no reasoning effort with no model source: the agentOptions key is absent', async () => {
+  dropHandoverSlot()
+  const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
+  const { ctx, routes } = makeFakeCtx({ agents, dshHomePath: (p) => path.join(wsTmp, p) })
+  new DshWebhookDispatcherPlugin(ctx, { endpoints: [ENDPOINT_GH] })
+  routes.get('/gh').handler(fakeReq({ method: 'GET' }).req, fakeRes())
+  await flush()
+  assert.equal('agentOptions' in agents.calls[0], false)
 })
 
 await okA('plugin: the deployment default preset is mounted through the create setup hook', async () => {

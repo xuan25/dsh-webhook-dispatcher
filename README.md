@@ -11,7 +11,7 @@ per-service bridge code.
   @deepseek-ai/dsh-host-webserver - see Cross-profile deployment); external
   reachability is the operator's reverse-proxy decision
 - Per-endpoint configuration: identity (id / path / name), token auth, policy
-  text, working directory, sandbox, model, and resource limits
+  text, working directory, sandbox, model, reasoning effort, and resource limits
 - Each admitted delivery spawns a fresh agent session; per-endpoint
   concurrency and queue caps, with `429` + `Retry-After` backpressure
 - A single `webhook status` tool verb reports live routes, queue depth, and
@@ -74,6 +74,7 @@ layer > env > built-in defaults.
         # auth: <TOKEN_ENV>           (env var NAME holding the token value; empty = open endpoint)
         # sandbox: workspace-write    (read-only | workspace-write | danger-full-access)
         # model: some/model           (default: the default selection ladder)
+        # reasoningEffort: low        (closed set off|minimal|low|medium|high|xhigh|max; absent: the framework provider default)
         # maxConcurrent: 1            (default)
         # maxQueue: 100               (default)
         # maxBodyBytes: 262144        (default)
@@ -92,6 +93,7 @@ DSH_WEBHOOK_<NAME>_PATH=/<path>
 DSH_WEBHOOK_<NAME>_POLICY="Treat the content as a task description and act on it."
 DSH_WEBHOOK_<NAME>_AUTH=<TOKEN_ENV>   # the NAME of the env holding the token value
 DSH_WEBHOOK_<NAME>_MODEL=some/model
+DSH_WEBHOOK_<NAME>_REASONING_EFFORT=low
 <TOKEN_ENV>=...
 ```
 
@@ -104,6 +106,7 @@ DSH_WEBHOOK_<NAME>_MODEL=some/model
 | `auth` | `AUTH` | empty (open endpoint) |
 | `sandbox` | `SANDBOX` | the session default |
 | `model` | `MODEL` | the default selection ladder |
+| `reasoningEffort` | `REASONING_EFFORT` | the framework provider default (closed set off/minimal/low/medium/high/xhigh/max, validated at boot) |
 | `maxConcurrent` | `MAX_CONCURRENT` | 1 |
 | `maxQueue` | `MAX_QUEUE` | 100 |
 | `maxBodyBytes` | `MAX_BODY_BYTES` | 262144 |
