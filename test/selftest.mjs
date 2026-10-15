@@ -1508,12 +1508,13 @@ await okA('plugin: a dropped endpoint logs one line with its stale counts on rec
 
 // ---------------------------------------------------------------- offload plane
 // The offload plane (retention window, retention log, the sweep, the plugin
-// lifecycle), in the same section order as the other offload plugins: O1 the
-// window grammar, O2 the retention log format, O3 the offload batch knob,
-// O4 the round-health gates, O5 the sweep entry-pass states, O6 the per-sweep
-// budget and compaction, O7 the growth-trend alert, O8 the periodic arming,
-// O9 the dispatch lifecycle through the real plugin, O10 the lost-log warning
-// and the append/rewrite mutex, O11 the layout pin.
+// lifecycle), in the same section order as the other offload plugins: window
+// the window grammar, retlog the retention log format, knob the offload batch
+// knob, health the round-health gates, sweep the sweep entry-pass states,
+// budget the per-sweep budget and compaction, trend the growth-trend alert,
+// arming the periodic arming, lifecycle the dispatch lifecycle through the
+// real plugin, logfault the lost-log warning and the append/rewrite mutex,
+// layout the layout pin.
 console.log('offload plane')
 {
   const offload = await import(path.join(root, 'lib', 'offload.js'))
@@ -1629,54 +1630,54 @@ console.log('offload plane')
     return dir
   }
 
-  // -- O1: the retention window parser (number = ms; string = 1-2 segments
+  // -- window: the retention window parser (number = ms; string = 1-2 segments
   //        in descending unit order; the discriminating vectors rejected)
-  ok('O1a: number windows are non-negative integer ms', () =>
+  ok('window-a: number windows are non-negative integer ms', () =>
     assert.deepEqual([parseWindowMs(0).ms, parseWindowMs(900000).ms], [0, 900000]),
   )
-  ok('O1a: a negative, fractional or NaN number window is invalid', () =>
+  ok('window-a: a negative, fractional or NaN number window is invalid', () =>
     assert.ok(!parseWindowMs(-1).ok && !parseWindowMs(1.5).ok && !parseWindowMs(Number.NaN).ok),
   )
-  ok('O1b: one-segment duration strings', () =>
+  ok('window-b: one-segment duration strings', () =>
     assert.deepEqual(
       [parseWindowMs('1d').ms, parseWindowMs('24h').ms, parseWindowMs('30m').ms, parseWindowMs('90s').ms, parseWindowMs('5000ms').ms],
       [86_400_000, 86_400_000, 1_800_000, 90_000, 5000],
     ),
   )
-  ok('O1b: two-segment durations in descending unit order', () =>
+  ok('window-b: two-segment durations in descending unit order', () =>
     assert.deepEqual(
       [parseWindowMs('1h30m').ms, parseWindowMs('4h30m').ms, parseWindowMs('1m30s').ms, parseWindowMs('1s500ms').ms],
       [5_400_000, 16_200_000, 90_000, 1500],
     ),
   )
-  ok('O1c: the discriminating vectors are all invalid (strict segment grammar)', () =>
+  ok('window-c: the discriminating vectors are all invalid (strict segment grammar)', () =>
     assert.ok(
       ['1h30m30s', '30m4h', '1w', '1h 30m', '30', '5000', 'h', '24H', '1ms2s', '1w30m', 'banana', ''].every((v) => !parseWindowMs(v).ok),
     ),
   )
-  ok('O1c: the range guard rejects overflow', () => assert.ok(!parseWindowMs('900000000d').ok))
+  ok('window-c: the range guard rejects overflow', () => assert.ok(!parseWindowMs('900000000d').ok))
 
-  // -- O2: the retention log (round trip, single append write per line, the
+  // -- retlog: the retention log (round trip, single append write per line, the
   //        torn-tail repair, the bad-line skip, the atomic rewrite)
   {
     const dir = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
     try {
       const log = path.join(dir, 'sub', 'retention-log.jsonl')
       const r0 = await readRetentionLog(log)
-      ok('O2a: reading a missing log is an empty, un-repaired read', () =>
+      ok('retlog-a: reading a missing log is an empty, un-repaired read', () =>
         assert.deepEqual([r0.entries.length, r0.repaired, r0.badLines], [0, false, 0]),
       )
       await appendRetentionEntry(log, { id: 'a', createdAt: iso(1), unit: 'gh', cwd: '/x/w' })
       await appendRetentionEntry(log, { id: 'b', createdAt: iso(2), unit: 'gh' })
       const lines = readFileSync(log, 'utf8').split('\n')
-      ok('O2a: each append is exactly one complete line (single write per line)', () =>
+      ok('retlog-a: each append is exactly one complete line (single write per line)', () =>
         assert.equal(lines.filter((l) => l !== '').length, 2),
       )
-      ok('O2a: the cwd key is present for the first line and omitted for the second', () =>
+      ok('retlog-a: the cwd key is present for the first line and omitted for the second', () =>
         assert.ok(lines[0].includes('"cwd":"/x/w"') && !lines[1].includes('cwd')),
       )
       const r1 = await readRetentionLog(log)
-      ok('O2a: the round trip preserves the entry shape and order', () =>
+      ok('retlog-a: the round trip preserves the entry shape and order', () =>
         assert.equal(
           JSON.stringify(r1.entries),
           JSON.stringify([{ id: 'a', createdAt: iso(1), unit: 'gh', cwd: '/x/w' }, { id: 'b', createdAt: iso(2), unit: 'gh' }]),
@@ -1685,7 +1686,7 @@ console.log('offload plane')
       const torn = path.join(dir, 'torn.jsonl')
       writeFileSync(torn, `{"id":"a","createdAt":"${iso(1)}","unit":"gh"}\n{"id":"p","createdAt":"${iso(2)}","unit":"gh"`)
       const rt = await readRetentionLog(torn)
-      ok('O2b: a torn trailing line is repaired in place (back to the last newline)', () =>
+      ok('retlog-b: a torn trailing line is repaired in place (back to the last newline)', () =>
         assert.ok(
           rt.repaired === true &&
             rt.entries.length === 1 &&
@@ -1693,14 +1694,14 @@ console.log('offload plane')
         ),
       )
       await appendRetentionEntry(torn, { id: 'c', createdAt: iso(3), unit: 'gh' })
-      ok('O2b: an append after the repair lands on its own line', () =>
+      ok('retlog-b: an append after the repair lands on its own line', () =>
         assert.ok(readFileSync(torn, 'utf8').endsWith(`{"id":"c","createdAt":"${iso(3)}","unit":"gh"}\n`)),
       )
       const torn2 = path.join(dir, 'torn2.jsonl')
       writeFileSync(torn2, `{"id":"a","createdAt":"${iso(1)}","unit":"gh"`) // no trailing newline
       await appendRetentionEntry(torn2, { id: 'c', createdAt: iso(3), unit: 'gh' })
       const rt2 = await readRetentionLog(torn2)
-      ok('O2b: an append to a torn tail closes it first (the new line stays parseable)', () =>
+      ok('retlog-b: an append to a torn tail closes it first (the new line stays parseable)', () =>
         assert.ok(
           readFileSync(torn2, 'utf8') ===
             `{"id":"a","createdAt":"${iso(1)}","unit":"gh"\n{"id":"c","createdAt":"${iso(3)}","unit":"gh"}\n` &&
@@ -1710,37 +1711,37 @@ console.log('offload plane')
       const bad = path.join(dir, 'bad.jsonl')
       writeFileSync(bad, `{"id":"a","createdAt":"${iso(1)}","unit":"gh"}\nnot json\n{"id":"b","createdAt":"${iso(2)}","unit":"gh"}\n`)
       const rb = await readRetentionLog(bad)
-      ok('O2c: unparseable lines are skipped and counted', () =>
+      ok('retlog-c: unparseable lines are skipped and counted', () =>
         assert.deepEqual([rb.entries.length, rb.badLines, rb.repaired], [2, 1, false]),
       )
       await rewriteRetentionLog(log, [r1.entries[1]])
       const r2 = await readRetentionLog(log)
-      ok('O2d: the compaction rewrite keeps exactly the survivors, in order', () =>
+      ok('retlog-d: the compaction rewrite keeps exactly the survivors, in order', () =>
         assert.deepEqual(r2.entries.map((e) => e.id), ['b']),
       )
-      ok('O2d: no temp file remains after the rewrite', () => assert.ok(!existsSync(`${log}.tmp`)))
+      ok('retlog-d: no temp file remains after the rewrite', () => assert.ok(!existsSync(`${log}.tmp`)))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   }
 
-  // -- O3: the offload batch knob (env DSH_WEBHOOK_OFFLOAD_BATCH: a positive
+  // -- knob: the offload batch knob (env DSH_WEBHOOK_OFFLOAD_BATCH: a positive
   //        integer, or the warn-and-keep degradation; the window itself is an
   //        endpoint field / DSH_WEBHOOK_<ID>_SESSION_RETENTION, exercised in
-  //        the plugin-level O9 cases)
+  //        the plugin-level lifecycle cases)
   {
-    ok('O3a: an absent knob falls back to the default', () =>
+    ok('knob-a: an absent knob falls back to the default', () =>
       assert.equal(parseOffloadBatch(undefined, () => {}), DEFAULT_OFFLOAD_BATCH),
     )
-    ok('O3a: a valid knob value is used', () => assert.equal(parseOffloadBatch('7', () => {}), 7))
-    ok('O3a: the default constant is 50', () => assert.equal(DEFAULT_OFFLOAD_BATCH, 50))
+    ok('knob-a: a valid knob value is used', () => assert.equal(parseOffloadBatch('7', () => {}), 7))
+    ok('knob-a: the default constant is 50', () => assert.equal(DEFAULT_OFFLOAD_BATCH, 50))
     const warns = []
     for (const v of ['0', '-2', 'abc', '5.5']) parseOffloadBatch(v, (m) => warns.push(m))
-    ok('O3b: each invalid knob value warns and falls back to the default', () => assert.equal(warns.length, 4))
-    ok('O3b: the warning names the knob', () => assert.ok(warns.every((m) => m.includes('DSH_WEBHOOK_OFFLOAD_BATCH'))))
+    ok('knob-b: each invalid knob value warns and falls back to the default', () => assert.equal(warns.length, 4))
+    ok('knob-b: the warning names the knob', () => assert.ok(warns.every((m) => m.includes('DSH_WEBHOOK_OFFLOAD_BATCH'))))
   }
 
-  // -- O4: round health (the disabled branches: unreachable persistence
+  // -- health: round health (the disabled branches: unreachable persistence
   //        service, missing store root, the mount mismatch; the registry
   //        fallback to the in-flight set)
   {
@@ -1750,11 +1751,11 @@ console.log('offload plane')
         return makeSweeper(home, { storeRoot, services: {} })
       },
       ({ report, warns }) => {
-        ok('O4a: an unreachable persistence service skips the round with a warning', () => {
+        ok('health-a: an unreachable persistence service skips the round with a warning', () => {
           assert.ok(report.disabled !== undefined)
           assert.ok(warns.some((m) => m.includes('persistence service is unreachable')))
         })
-        ok('O4a: the skipped round performs no action', () =>
+        ok('health-a: the skipped round performs no action', () =>
           assert.deepEqual([report.candidates, report.offloaded, report.balance], [0, 0, 0]),
         )
       },
@@ -1765,7 +1766,7 @@ console.log('offload plane')
         return makeSweeper(home, { storeRoot, services: { sessionPersistence: makeSpService(storeRoot) } })
       },
       ({ report, warns }) => {
-        ok('O4b: a missing store root disables the round with a warning', () => {
+        ok('health-b: a missing store root disables the round with a warning', () => {
           assert.ok(report.disabled !== undefined)
           assert.ok(warns.some((m) => m.includes('store root is missing')))
         })
@@ -1781,7 +1782,7 @@ console.log('offload plane')
         })
       },
       ({ report, warns }) => {
-        ok('O4c: a mount mismatch disables the round with a warning', () => {
+        ok('health-c: a mount mismatch disables the round with a warning', () => {
           assert.ok(report.disabled !== undefined)
           assert.ok(warns.some((m) => m.includes('different mounts')))
         })
@@ -1800,7 +1801,7 @@ console.log('offload plane')
         })
       },
       ({ report, warns }) => {
-        ok('O4d: an unreachable registry falls back to the in-flight set with a warning', () => {
+        ok('health-d: an unreachable registry falls back to the in-flight set with a warning', () => {
           assert.equal(report.offloaded, 1)
           assert.ok(warns.some((m) => m.includes('registry service is unreachable')))
         })
@@ -1820,18 +1821,18 @@ console.log('offload plane')
         })
       },
       async ({ report, warns, logPath }) => {
-        ok('O4d: with the registry unreachable the in-flight set alone gates liveness', () => {
+        ok('health-d: with the registry unreachable the in-flight set alone gates liveness', () => {
           assert.equal(report.skippedLive, 1)
           assert.ok(warns.some((m) => m.includes('registry service is unreachable')))
         })
-        await okA('O4d: the live entry stays in the log', async () =>
+        await okA('health-d: the live entry stays in the log', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 1),
         )
       },
     )
   }
 
-  // -- O5: the sweep core (window semantics, the existence table, the
+  // -- sweep: the sweep core (window semantics, the existence table, the
   //        liveness rollback, the retry, the unit-gone rule)
   {
     // Cell 1: source present, destination absent (the normal path).
@@ -1848,14 +1849,14 @@ console.log('offload plane')
         })
       },
       async ({ report, storeRoot, archiveDir, logPath }) => {
-        ok('O5a: the over-window settled session is offloaded', () =>
+        ok('sweep-a: the over-window settled session is offloaded', () =>
           assert.deepEqual([report.offloaded, report.candidates], [1, 1]),
         )
-        ok('O5a: the session dir left the store and entered the archive', () => {
+        ok('sweep-a: the session dir left the store and entered the archive', () => {
           assert.ok(!existsSync(path.join(storeRoot, WS, 'c1')))
           assert.ok(existsSync(path.join(archiveDir, 'c1')))
         })
-        await okA('O5a: the completed line is removed by the compaction rewrite', async () =>
+        await okA('sweep-a: the completed line is removed by the compaction rewrite', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 0),
         )
       },
@@ -1873,10 +1874,10 @@ console.log('offload plane')
         })
       },
       async ({ report, logPath }) => {
-        ok('O5b: a session on neither side completes (source gone)', () =>
+        ok('sweep-b: a session on neither side completes (source gone)', () =>
           assert.deepEqual([report.sourceGone, report.offloaded, report.errors], [1, 0, 0]),
         )
-        await okA('O5b: the completed line is removed', async () =>
+        await okA('sweep-b: the completed line is removed', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 0),
         )
       },
@@ -1896,10 +1897,10 @@ console.log('offload plane')
         })
       },
       async ({ report, logPath }) => {
-        ok('O5c: a session already in the archive completes (already archived)', () =>
+        ok('sweep-c: a session already in the archive completes (already archived)', () =>
           assert.deepEqual([report.alreadyArchived, report.offloaded, report.errors], [1, 0, 0]),
         )
-        await okA('O5c: the completed line is removed', async () =>
+        await okA('sweep-c: the completed line is removed', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 0),
         )
       },
@@ -1920,15 +1921,15 @@ console.log('offload plane')
         })
       },
       async ({ report, storeRoot, archiveDir, logPath, warns }) => {
-        ok('O5d: both sides present is an error, both sides kept', () => {
+        ok('sweep-d: both sides present is an error, both sides kept', () => {
           assert.deepEqual([report.errors, report.offloaded], [1, 0])
           assert.ok(warns.some((m) => m.includes('both exist for session c4')))
         })
-        ok('O5d: the source is intact and the archive side untouched', () => {
+        ok('sweep-d: the source is intact and the archive side untouched', () => {
           assert.ok(existsSync(path.join(storeRoot, WS, 'c4')))
           assert.ok(existsSync(path.join(archiveDir, 'c4')))
         })
-        await okA('O5d: the line stays in the log', async () =>
+        await okA('sweep-d: the line stays in the log', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 1),
         )
       },
@@ -1951,12 +1952,12 @@ console.log('offload plane')
         })
       },
       async ({ report, storeRoot, logPath, warns }) => {
-        ok('O5e: a rename transport failure is an error, the entry is kept', () => {
+        ok('sweep-e: a rename transport failure is an error, the entry is kept', () => {
           assert.deepEqual([report.errors, report.offloaded], [1, 0])
           assert.ok(warns.some((m) => m.includes('retried next round')))
         })
-        ok('O5e: the source is intact', () => assert.ok(existsSync(path.join(storeRoot, WS, 'eio'))))
-        await okA('O5e: the line stays in the log', async () =>
+        ok('sweep-e: the source is intact', () => assert.ok(existsSync(path.join(storeRoot, WS, 'eio'))))
+        await okA('sweep-e: the line stays in the log', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 1),
         )
       },
@@ -1979,10 +1980,10 @@ console.log('offload plane')
         })
       },
       async ({ report, logPath }) => {
-        ok('O5f: a rename ENOENT converges to source-gone', () =>
+        ok('sweep-f: a rename ENOENT converges to source-gone', () =>
           assert.deepEqual([report.sourceGone, report.errors], [1, 0]),
         )
-        await okA('O5f: the entry completed and its line was removed', async () =>
+        await okA('sweep-f: the entry completed and its line was removed', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 0),
         )
       },
@@ -2008,10 +2009,10 @@ console.log('offload plane')
         })
       },
       async ({ report, logPath }) => {
-        ok('O5g: an EEXIST with the source gone means the offload already happened', () =>
+        ok('sweep-g: an EEXIST with the source gone means the offload already happened', () =>
           assert.deepEqual([report.alreadyArchived, report.errors], [1, 0]),
         )
-        await okA('O5g: the entry completed', async () =>
+        await okA('sweep-g: the entry completed', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 0),
         )
       },
@@ -2034,12 +2035,12 @@ console.log('offload plane')
         })
       },
       async ({ report, storeRoot, logPath, warns }) => {
-        ok('O5g: an EEXIST with the source present is an error, both sides kept', () => {
+        ok('sweep-g: an EEXIST with the source present is an error, both sides kept', () => {
           assert.deepEqual([report.errors, report.offloaded], [1, 0])
           assert.ok(warns.some((m) => m.includes('both sides remain')))
         })
-        ok('O5g: the source is intact', () => assert.ok(existsSync(path.join(storeRoot, WS, 'eex'))))
-        await okA('O5g: the line stays in the log', async () =>
+        ok('sweep-g: the source is intact', () => assert.ok(existsSync(path.join(storeRoot, WS, 'eex'))))
+        await okA('sweep-g: the line stays in the log', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 1),
         )
       },
@@ -2058,11 +2059,11 @@ console.log('offload plane')
         })
       },
       async ({ report, logPath, warns }) => {
-        ok('O5h: a locate failure keeps the entry for the next round', () => {
+        ok('sweep-h: a locate failure keeps the entry for the next round', () => {
           assert.deepEqual([report.errors, report.offloaded], [1, 0])
           assert.ok(warns.some((m) => m.includes('locating session loc failed')))
         })
-        await okA('O5h: the line stays in the log', async () =>
+        await okA('sweep-h: the line stays in the log', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 1),
         )
       },
@@ -2098,14 +2099,14 @@ console.log('offload plane')
         }
       },
       async ({ report, storeRoot, archiveDir, logPath }) => {
-        ok('O5i: a session that goes live in the gap is neither offloaded nor an error', () =>
+        ok('sweep-i: a session that goes live in the gap is neither offloaded nor an error', () =>
           assert.deepEqual([report.offloaded, report.errors, report.skippedLive], [0, 0, 0]),
         )
-        ok('O5i: the rollback moved the session back to the store', () => {
+        ok('sweep-i: the rollback moved the session back to the store', () => {
           assert.ok(existsSync(path.join(storeRoot, WS, 'rb')))
           assert.ok(!existsSync(path.join(archiveDir, 'rb')))
         })
-        await okA('O5i: the entry is kept for the next round', async () =>
+        await okA('sweep-i: the entry is kept for the next round', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 1),
         )
       },
@@ -2124,10 +2125,10 @@ console.log('offload plane')
         })
       },
       ({ report, archiveDir }) => {
-        ok('O5j: a vanished unit is offloaded immediately, regardless of age', () =>
+        ok('sweep-j: a vanished unit is offloaded immediately, regardless of age', () =>
           assert.deepEqual([report.offloaded, report.candidates], [1, 1]),
         )
-        ok('O5j: the fresh (within-window-age) session was moved', () => assert.ok(existsSync(path.join(archiveDir, 'ug'))))
+        ok('sweep-j: the fresh (within-window-age) session was moved', () => assert.ok(existsSync(path.join(archiveDir, 'ug'))))
       },
     )
     await runCase(
@@ -2144,7 +2145,7 @@ console.log('offload plane')
         })
       },
       ({ report }) => {
-        ok('O5j: the liveness gate still applies to a vanished unit', () =>
+        ok('sweep-j: the liveness gate still applies to a vanished unit', () =>
           assert.deepEqual([report.skippedLive, report.offloaded], [1, 0]),
         )
       },
@@ -2164,10 +2165,10 @@ console.log('offload plane')
         })
       },
       async ({ report, logPath }) => {
-        ok('O5k: a window-0 unit keeps even ancient entries', () =>
+        ok('sweep-k: a window-0 unit keeps even ancient entries', () =>
           assert.deepEqual([report.candidates, report.offloaded], [0, 0]),
         )
-        await okA('O5k: the line survives', async () =>
+        await okA('sweep-k: the line survives', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 1),
         )
       },
@@ -2189,10 +2190,10 @@ console.log('offload plane')
         })
       },
       ({ report, archiveDir, storeRoot }) => {
-        ok('O5l: the reopened window offloads the over-window entries and keeps the fresh one', () =>
+        ok('sweep-l: the reopened window offloads the over-window entries and keeps the fresh one', () =>
           assert.deepEqual([report.offloaded, report.candidates], [1, 1]),
         )
-        ok('O5l: the over-window session is archived, the fresh one stays in the store', () => {
+        ok('sweep-l: the over-window session is archived, the fresh one stays in the store', () => {
           assert.ok(existsSync(path.join(archiveDir, 'old')))
           assert.ok(existsSync(path.join(storeRoot, WS, 'new')))
         })
@@ -2213,10 +2214,10 @@ console.log('offload plane')
         })
       },
       ({ report, archiveDir }) => {
-        ok('O5m: a cwd-less entry is offloaded through the store-root top level', () =>
+        ok('sweep-m: a cwd-less entry is offloaded through the store-root top level', () =>
           assert.deepEqual([report.offloaded, report.errors], [1, 0]),
         )
-        ok('O5m: the archive copy is named after the session id', () => assert.ok(existsSync(path.join(archiveDir, 'nc'))))
+        ok('sweep-m: the archive copy is named after the session id', () => assert.ok(existsSync(path.join(archiveDir, 'nc'))))
       },
     )
     // The archive dir is rebuilt after external deletion (the next round
@@ -2241,15 +2242,15 @@ console.log('offload plane')
         return handles
       },
       ({ report, archiveDir }) => {
-        ok('O5n: after the archive dir was deleted externally the next round rebuilds it and continues', () =>
+        ok('sweep-n: after the archive dir was deleted externally the next round rebuilds it and continues', () =>
           assert.deepEqual([report.offloaded, report.errors], [1, 0]),
         )
-        ok('O5n: the rebuilt archive holds the new offload', () => assert.ok(existsSync(path.join(archiveDir, 'h3'))))
+        ok('sweep-n: the rebuilt archive holds the new offload', () => assert.ok(existsSync(path.join(archiveDir, 'h3'))))
       },
     )
   }
 
-  // -- O6: the per-sweep budget (file order, the oldest-first identity, the
+  // -- budget: the per-sweep budget (file order, the oldest-first identity, the
   //        knob, the compaction regimes, sweep idempotency)
   {
     // 51 candidates with the default cap of 50: the first round takes the
@@ -2272,20 +2273,20 @@ console.log('offload plane')
           now: () => T0,
         })
         const first = await sweeper.sweep()
-        ok('O6a: the first round offloads exactly the budget', () =>
+        ok('budget-a: the first round offloads exactly the budget', () =>
           assert.deepEqual([first.offloaded, first.candidates], [50, 50]),
         )
-        await okA('O6a: the identity is the single remainder line, in file order', async () =>
+        await okA('budget-a: the identity is the single remainder line, in file order', async () =>
           assert.equal(
             JSON.stringify((await readRetentionLog(logPath)).entries.map((e) => e.id)),
             JSON.stringify(['n50']),
           ),
         )
         const second = await sweeper.sweep()
-        ok('O6a: the second round offloads the single remainder', () =>
+        ok('budget-a: the second round offloads the single remainder', () =>
           assert.deepEqual([second.offloaded, second.candidates], [1, 1]),
         )
-        await okA('O6a: the log is empty after both rounds', async () =>
+        await okA('budget-a: the log is empty after both rounds', async () =>
           assert.equal((await readRetentionLog(logPath)).entries.length, 0),
         )
       } finally {
@@ -2312,9 +2313,9 @@ console.log('offload plane')
           now: () => T0,
         })
         const first = await sweeper.sweep()
-        ok('O6b: a valid knob value caps the round', () => assert.deepEqual([first.offloaded, first.candidates], [3, 3]))
+        ok('budget-b: a valid knob value caps the round', () => assert.deepEqual([first.offloaded, first.candidates], [3, 3]))
         const second = await sweeper.sweep()
-        ok('O6b: the remainder drains on the next round', () => assert.equal(second.offloaded, 2))
+        ok('budget-b: the remainder drains on the next round', () => assert.equal(second.offloaded, 2))
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -2339,12 +2340,12 @@ console.log('offload plane')
           now: () => T0,
         })
         const first = await sweeper.sweep()
-        ok('O6c: the rate within the budget drains the file in one round', () =>
+        ok('budget-c: the rate within the budget drains the file in one round', () =>
           assert.deepEqual([first.offloaded, first.removedLines, first.balance], [30, 30, 0]),
         )
-        ok('O6c: the compaction ratio triggered the rewrite', () => assert.equal(first.completedRatio, 1))
+        ok('budget-c: the compaction ratio triggered the rewrite', () => assert.equal(first.completedRatio, 1))
         const second = await sweeper.sweep()
-        ok('O6c: the next round is a zero-action no-op (sweep idempotency)', () =>
+        ok('budget-c: the next round is a zero-action no-op (sweep idempotency)', () =>
           assert.deepEqual([second.candidates, second.offloaded, second.removedLines, second.balance, second.increment], [0, 0, 0, 0, 0]),
         )
       } finally {
@@ -2377,17 +2378,17 @@ console.log('offload plane')
           }
           rounds.push(await sweeper.sweep())
         }
-        ok('O6d: the over-budget rate rewrites while the completed share stays high', () =>
+        ok('budget-d: the over-budget rate rewrites while the completed share stays high', () =>
           assert.equal(
             JSON.stringify(rounds.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])),
             JSON.stringify([[3, 3, 2], [3, 3, 4], [3, 3, 6]]),
           ),
         )
-        ok('O6d: every offload landed in the archive', () => {
+        ok('budget-d: every offload landed in the archive', () => {
           assert.ok(existsSync(path.join(archiveDir, 'q00')))
           assert.ok(existsSync(path.join(archiveDir, 'q13')))
         })
-        ok('O6d: the file line count equals the reported balance', () =>
+        ok('budget-d: the file line count equals the reported balance', () =>
           assert.equal(readFileSync(logPath, 'utf8').trim().split('\n').length, 6),
         )
       } finally {
@@ -2396,7 +2397,7 @@ console.log('offload plane')
     }
   }
 
-  // -- O7: the trend alert (the consecutive over-envelope increments, the
+  // -- trend: the trend alert (the consecutive over-envelope increments, the
   //        healthy negatives, the out-of-regime dormant branch, the knob
   //        recovery)
   {
@@ -2419,14 +2420,14 @@ console.log('offload plane')
           for (let i = 0; i < 60; i++) await appendRetentionEntry(logPath, { id: `t${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
           results.push(await sweeper.sweep())
         }
-        ok('O7a: the alert fires exactly on the K-th consecutive over-envelope sweep', () =>
+        ok('trend-a: the alert fires exactly on the K-th consecutive over-envelope sweep', () =>
           assert.equal(
             JSON.stringify(results.map((rp) => rp.trendAlert)),
             JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true, true]),
           ),
         )
-        ok('O7a: the balance grows by the arrivals each round', () => assert.equal(results[12].balance, 13 * 60))
-        ok('O7a: the reported increment is the arrivals', () => assert.equal(results[12].increment, 60))
+        ok('trend-a: the balance grows by the arrivals each round', () => assert.equal(results[12].balance, 13 * 60))
+        ok('trend-a: the reported increment is the arrivals', () => assert.equal(results[12].increment, 60))
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -2450,7 +2451,7 @@ console.log('offload plane')
           for (let i = 0; i < burst; i++) await appendRetentionEntry(logPath, { id: `h${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
           results.push(await sweeper.sweep())
         }
-        ok('O7b: a burst shorter than K rounds never alerts', () => assert.ok(results.every((rp) => !rp.trendAlert)))
+        ok('trend-b: a burst shorter than K rounds never alerts', () => assert.ok(results.every((rp) => !rp.trendAlert)))
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
@@ -2473,7 +2474,7 @@ console.log('offload plane')
           for (let i = 0; i < 50; i++) await appendRetentionEntry(logPath, { id: `b${r}-${i}`, createdAt: iso(T0), unit: 'cold' })
           results.push(await sweeper.sweep())
         }
-        ok('O7c: arrivals at exactly the budget never alert (the comparison is strict)', () =>
+        ok('trend-c: arrivals at exactly the budget never alert (the comparison is strict)', () =>
           assert.ok(results.every((rp) => !rp.trendAlert)),
         )
       } finally {
@@ -2515,16 +2516,16 @@ console.log('offload plane')
           }
           results.push(await sweeper.sweep())
         }
-        ok('O7d: the out-of-regime rate alerts after K consecutive rounds', () =>
+        ok('trend-d: the out-of-regime rate alerts after K consecutive rounds', () =>
           assert.equal(
             JSON.stringify(results.map((rp) => rp.trendAlert)),
             JSON.stringify([false, false, false, false, false, false, false, false, false, false, true, true]),
           ),
         )
-        ok('O7d: the compaction trigger stayed dormant through the whole burst', () =>
+        ok('trend-d: the compaction trigger stayed dormant through the whole burst', () =>
           assert.ok(results.every((rp) => rp.removedLines === 0 && rp.completedRatio < COMPACTION_RATIO)),
         )
-        ok('O7d: the deadweight backlog accumulated in the log file', () =>
+        ok('trend-d: the deadweight backlog accumulated in the log file', () =>
           assert.equal(readFileSync(logPath, 'utf8').trim().split('\n').length, 12 * 21),
         )
         // The operator raises the knob: a fresh instance (like a process
@@ -2547,22 +2548,22 @@ console.log('offload plane')
         for (let r = 0; r < 3; r++) {
           recovery.push(await sweeper.sweep())
         }
-        ok('O7d: the raised knob re-enables the compaction trigger and flushes the backlog', () =>
+        ok('trend-d: the raised knob re-enables the compaction trigger and flushes the backlog', () =>
           assert.equal(
             JSON.stringify(recovery.map((rp) => [rp.offloaded, rp.removedLines, rp.balance])),
             JSON.stringify([[25, 85, 167], [25, 0, 167], [25, 50, 117]]),
           ),
         )
-        ok('O7d: no trend alert under the recovered budget', () => assert.ok(recovery.every((rp) => !rp.trendAlert)))
+        ok('trend-d: no trend alert under the recovered budget', () => assert.ok(recovery.every((rp) => !rp.trendAlert)))
         const survivors = await readRetentionLog(logPath)
-        ok('O7d: only the pending (never-offloaded) lines survived the flush', () =>
+        ok('trend-d: only the pending (never-offloaded) lines survived the flush', () =>
           assert.equal(survivors.entries.length, 117),
         )
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
     }
-    // O7e: the alert line content (growth rate = (increment - cap) per sweep
+    // trend-e: the alert line content (growth rate = (increment - cap) per sweep
     // and the branch discriminator: dormant out-of-regime vs active in-regime).
     {
       for (const [arrivals, cap, dormant] of [
@@ -2603,7 +2604,7 @@ console.log('offload plane')
           const want = dormant
             ? ['growth rate 16/sweep', 'permanently dormant', 'completed lines are never evicted', 'check the offload batch knob first']
             : ['growth rate 2/sweep', 'still active', 'raise the offload batch knob or lower the dispatch rate']
-          ok(`O7e: the alert line carries the ${dormant ? 'dormant-branch' : 'active-branch'} content`, () => {
+          ok(`trend-e: the alert line carries the ${dormant ? 'dormant-branch' : 'active-branch'} content`, () => {
             assert.ok(alert !== undefined)
             for (const f of want) assert.ok(alert.includes(f), `missing: ${f}`)
           })
@@ -2615,7 +2616,7 @@ console.log('offload plane')
     }
   }
 
-  // -- O8: the periodic arming (the immediate first round, re-arm is a
+  // -- arming: the periodic arming (the immediate first round, re-arm is a
   //        no-op, the disposer stops the timer)
   {
     const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
@@ -2628,16 +2629,16 @@ console.log('offload plane')
       })
       sweeper.start()
       await flush()
-      ok('O8a: start arms an immediate first round', () => assert.ok(infos.some((m) => m.includes('sweep done'))))
+      ok('arming-a: start arms an immediate first round', () => assert.ok(infos.some((m) => m.includes('sweep done'))))
       sweeper.start() // re-arming is a no-op
       sweeper.dispose()
-      ok('O8a: dispose stops the timer without error', () => true)
+      ok('arming-a: dispose stops the timer without error', () => true)
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
   }
 
-  // -- O9: the dispatch lifecycle through the real plugin (the write gate,
+  // -- lifecycle: the dispatch lifecycle through the real plugin (the write gate,
   //        the end-to-end archive move, the liveness gates, the units
   //        snapshot, the plane-unloaded degradation)
   {
@@ -2666,10 +2667,10 @@ console.log('offload plane')
       return res
     }
 
-    // O9a: the write gate open - a dispatched settled session is logged with
+    // lifecycle-a: the write gate open - a dispatched settled session is logged with
     // the session id, the endpoint unit, the dispatch time and the shared
     // workspace (the D18 default).
-    await okA('O9a: a dispatched session with a retention window records the line (the write gate)', async () => {
+    await okA('lifecycle-a: a dispatched session with a retention window records the line (the write gate)', async () => {
       dropHandoverSlot()
       const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
       const { home, logPath, routes, effects, plugin } = pluginProbe({
@@ -2690,8 +2691,8 @@ console.log('offload plane')
       disposeAll(effects)
       rmSync(home, { recursive: true, force: true })
     })
-    // O9b: the write gate closed - a zero window is not tracked.
-    await okA('O9b: a zero-window (unconfigured) endpoint records nothing (the write gate closed)', async () => {
+    // lifecycle-b: the write gate closed - a zero window is not tracked.
+    await okA('lifecycle-b: a zero-window (unconfigured) endpoint records nothing (the write gate closed)', async () => {
       dropHandoverSlot()
       const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
       const { home, logPath, routes, effects, plugin } = pluginProbe({ endpoints: [ENDPOINT_GH], agents })
@@ -2704,9 +2705,9 @@ console.log('offload plane')
       disposeAll(effects)
       rmSync(home, { recursive: true, force: true })
     })
-    // O9c: the write gate, workspace side - a session whose workspace could
+    // lifecycle-c: the write gate, workspace side - a session whose workspace could
     // not be prepared is never tracked (its store location is undeterminable).
-    await okA('O9c: a session whose workspace could not be prepared is never tracked (silent)', async () => {
+    await okA('lifecycle-c: a session whose workspace could not be prepared is never tracked (silent)', async () => {
       dropHandoverSlot()
       const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
       const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
@@ -2734,8 +2735,8 @@ console.log('offload plane')
       disposeAll(effects)
       rmSync(home, { recursive: true, force: true })
     })
-    // O9d: the end-to-end archive move through the plugin's own sweeper.
-    await okA('O9d: an over-window settled session is offloaded end to end through the plugin sweeper', async () => {
+    // lifecycle-d: the end-to-end archive move through the plugin's own sweeper.
+    await okA('lifecycle-d: an over-window settled session is offloaded end to end through the plugin sweeper', async () => {
       dropHandoverSlot()
       const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
       const { home, storeRoot, logPath, routes, effects, plugin } = pluginProbe({
@@ -2759,9 +2760,9 @@ console.log('offload plane')
       disposeAll(effects)
       rmSync(home, { recursive: true, force: true })
     })
-    // O9e: the registry liveness gate (a session live in the framework
+    // lifecycle-e: the registry liveness gate (a session live in the framework
     // registry is never offloaded).
-    await okA('O9e: a session that is live in the registry is never offloaded (the liveness gate)', async () => {
+    await okA('lifecycle-e: a session that is live in the registry is never offloaded (the liveness gate)', async () => {
       dropHandoverSlot()
       const live = new Set()
       const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
@@ -2784,9 +2785,9 @@ console.log('offload plane')
       disposeAll(effects)
       rmSync(home, { recursive: true, force: true })
     })
-    // O9f: the in-flight gate (an unsettled dispatch is never offloaded,
+    // lifecycle-f: the in-flight gate (an unsettled dispatch is never offloaded,
     // regardless of age).
-    await okA('O9f: an unsettled (in-flight) dispatch is never offloaded', async () => {
+    await okA('lifecycle-f: an unsettled (in-flight) dispatch is never offloaded', async () => {
       dropHandoverSlot()
       const hang = makeFakeHandle({ events: [{ type: 'turn/end', data: { reason: 'completed' } }] })
       hang.handle.agent.whenIdle = () => new Promise(() => {}) // the settlement never completes
@@ -2812,10 +2813,10 @@ console.log('offload plane')
       disposeAll(effects)
       rmSync(home, { recursive: true, force: true })
     })
-    // O9g: the units snapshot (a rebuilt plugin instance carries its own
+    // lifecycle-g: the units snapshot (a rebuilt plugin instance carries its own
     // endpoint view; a removed endpoint is a vanished unit whose pending
     // lines follow the non-retention semantics).
-    await okA('O9g: a rebuilt instance carries its own endpoint view (a removed endpoint is a vanished unit)', async () => {
+    await okA('lifecycle-g: a rebuilt instance carries its own endpoint view (a removed endpoint is a vanished unit)', async () => {
       dropHandoverSlot()
       const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
       const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
@@ -2859,9 +2860,9 @@ console.log('offload plane')
       disposeAll(effectsB)
       rmSync(home, { recursive: true, force: true })
     })
-    // O9h: a host without the dshHomePath service loads the offload plane as
+    // lifecycle-h: a host without the dshHomePath service loads the offload plane as
     // unloaded (the plugin still dispatches; nothing is tracked).
-    await okA('O9h: a host without dshHomePath loads the offload plane as unloaded', async () => {
+    await okA('lifecycle-h: a host without dshHomePath loads the offload plane as unloaded', async () => {
       dropHandoverSlot()
       const agents = makeFakeAgents(() => Promise.resolve(okHandle().handle))
       const { ctx, routes, logs, effects } = makeFakeCtx({ agents })
@@ -2879,12 +2880,12 @@ console.log('offload plane')
       assert.ok(logs.warn.some((m) => m.includes('no dshHomePath service; creating the session without a workspace')))
       disposeAll(effects)
     })
-    // O9i: the unit is ALIVE but its window is removed (the endpoint stays
+    // lifecycle-i: the unit is ALIVE but its window is removed (the endpoint stays
     // in the configuration without sessionRetention) the recorded line is
-    // retained (window 0), in contrast to O9g's vanished unit. Pins the
+    // retained (window 0), in contrast to lifecycle-g's vanished unit. Pins the
     // constructor's units-map rule: a present endpoint without a window is a
     // live unit of window 0, never an absent unit.
-    await okA('O9i: a present endpoint whose retention is removed keeps its recorded lines', async () => {
+    await okA('lifecycle-i: a present endpoint whose retention is removed keeps its recorded lines', async () => {
       dropHandoverSlot()
       const home = mkdtempSync(path.join(tmpdir(), 'dsh-webhook-offload-'))
       const storeRoot = path.join(home, OFFLOAD_STORE_ROOT)
@@ -2931,7 +2932,7 @@ console.log('offload plane')
     })
   }
 
-  // -- O10: the lost-retention-log startup warning and the
+  // -- logfault: the lost-retention-log startup warning and the
   //         append<->compaction mutex (the rewrite-window seam)
   {
     const mkLostLogCase = async (seed) => {
@@ -2954,13 +2955,13 @@ console.log('offload plane')
       }
     }
     const fresh = await mkLostLogCase(() => {})
-    ok('O10a: a fresh install (no archive, no log) stays silent', () => assert.equal(fresh.length, 0))
+    ok('logfault-a: a fresh install (no archive, no log) stays silent', () => assert.equal(fresh.length, 0))
     const lost = await mkLostLogCase((archive) => {
       mkdirSync(path.join(archive, 'x'), { recursive: true })
       writeFileSync(path.join(archive, 'x', 'session.v4.jsonl.zstd'), 'log')
     })
-    ok('O10b: the lost log warns on the first round only (exactly once across rounds)', () => assert.equal(lost.length, 1))
-    // O10c: park the compaction rewrite between its temp write and its
+    ok('logfault-b: the lost log warns on the first round only (exactly once across rounds)', () => assert.equal(lost.length, 1))
+    // logfault-c: park the compaction rewrite between its temp write and its
     // rename, append across the window, and prove the mutex serializes the
     // append onto the post-rename file (the line survives).
     {
@@ -3012,7 +3013,7 @@ console.log('offload plane')
         const rep = await run
         clearInterval(keepAlive)
         const after = (await readRetentionLog(logPath)).entries
-        ok('O10c: an append parked in the rewrite window survives the rewrite (the write mutex)', () => {
+        ok('logfault-c: an append parked in the rewrite window survives the rewrite (the write mutex)', () => {
           assert.equal(rep.removedLines, 4)
           assert.equal(after.length, 2)
           assert.ok(after.some((e) => e.id === liveId))
@@ -3026,7 +3027,7 @@ console.log('offload plane')
     }
   }
 
-  // -- O11: the layout pin (the offload plane's home is the plugin home; the
+  // -- layout: the plugin-level layout pin (the offload plane's home is the plugin home; the
   //         store root is the framework session store, a SIBLING of the
   //         plugin home, never under it; the constructor wires the layout
   //         through the single helper). The pure-ASCII pin of the two
@@ -3034,20 +3035,20 @@ console.log('offload plane')
   //         top of this file (it scans the whole src/ tree).
   {
     const lay = offloadLayout((seg) => path.join('/h', seg))
-    ok('O11a: the layout resolves the plugin-home files under the plugin home', () => {
+    ok('layout-a: the layout resolves the plugin-home files under the plugin home', () => {
       assert.equal(lay.base, path.join('/h', OFFLOAD_HOME_BASE))
       assert.equal(lay.archive, path.join('/h', OFFLOAD_HOME_BASE, OFFLOAD_ARCHIVE_DIR))
       assert.equal(lay.log, path.join('/h', OFFLOAD_HOME_BASE, OFFLOAD_LOG_FILE))
     })
-    ok('O11a: the store root is the framework store, a sibling of the plugin home', () => {
+    ok('layout-a: the store root is the framework store, a sibling of the plugin home', () => {
       assert.equal(lay.storeRoot, path.join('/h', OFFLOAD_STORE_ROOT))
       assert.ok(!lay.storeRoot.startsWith(lay.base + path.sep))
     })
     const pluginSrc = readFileSync(path.join(root, 'src', 'plugin.ts'), 'utf8')
-    ok('O11b: the constructor wires the sweeper home through offloadLayout', () => {
+    ok('layout-b: the constructor wires the sweeper home through offloadLayout', () => {
       assert.ok(pluginSrc.includes('home: offloadLayout(resolveHome)'))
     })
-    ok('O11b: the constructor never re-derives the store root under the plugin home', () => {
+    ok('layout-b: the constructor never re-derives the store root under the plugin home', () => {
       assert.ok(!pluginSrc.includes('OFFLOAD_STORE_ROOT'))
     })
   }

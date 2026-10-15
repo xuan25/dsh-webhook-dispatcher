@@ -1,10 +1,11 @@
 // dsh-webhook-dispatcher: inbound webhook dispatch plugin for dsh (class
-// form). Endpoints are exact routes on the framework main webServer (the
-// Web GUI server: 127.0.0.1:3080 in this deployment); the plugin owns no
-// listener of its own, so external webhook senders reach its routes through
-// the owner-managed reverse-proxy ingress. Each admitted delivery spawns a
-// contained trigger session (bounded per endpoint by maxConcurrent /
-// maxQueue) whose first-turn prompt carries the delivery content.
+// form). Endpoints are exact routes on the framework main web server (the
+// process that serves the Web GUI); the plugin owns no listener of its own,
+// so external webhook senders reach its routes through the reverse-proxy or
+// ingress layer in front of the web server (an operator deployment decision).
+// Each admitted delivery spawns a contained trigger session (bounded per
+// endpoint by maxConcurrent / maxQueue) whose first-turn prompt carries the
+// delivery content.
 //
 // Plugin form = cordis class plugin (Service subclass): `new
 // DshWebhookDispatcherPlugin(ctx, validatedConfig)`. The constructor performs

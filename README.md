@@ -37,18 +37,18 @@ config layer (see Configuration).
 Endpoints register as exact routes on the profile's `webServer` service. The
 `web` profile provides it through the Web GUI server; every other profile
 (`sdk`, `acp`, a custom bundle) must compose a `webServer` provider into its
-own composition - `@deepseek-ai/dsh-host-webserver` is the framework's HTTP
-route server (a bare `node:http` listener without the Web UI; see its own
-docs). One-shot surfaces (`headless`) are not a fit (no resident listener):
+own composition - the framework's route server
+`@deepseek-ai/dsh-host-webserver` (see its own docs). One-shot surfaces such
+as `headless` cannot host a resident listener, so they cannot host this plugin:
 
 ```yaml
-# $DSH_HOME/profiles/<name>/cordis.patch.yml (example: the sdk profile)
+# $DSH_HOME/profiles/<name>/cordis.patch.yml (example)
 - insert:
     - id: webserver
       name: '@deepseek-ai/dsh-host-webserver'
       config:
-        host: 127.0.0.1
-        port: <port>  # a free fixed port; port 0 re-rolls the callback address on every restart
+        host: <host>
+        port: <port>  # a free fixed port; port 0 re-resolves the bound address on every restart
 ```
 
 ## Configuration
@@ -110,13 +110,11 @@ DSH_WEBHOOK_<NAME>_MODEL=some/model
 | `sessionRetention` | `SESSION_RETENTION` | absent (retain in the store) |
 
 - The id segment is the endpoint id uppercased with hyphens written as
-  underscores (`ci-run` -> `DSH_WEBHOOK_CI_RUN_*`); multi-word suffixes are
-  matched before one-word ones, so the parse is deterministic
+  underscores (`ci-run` -> `DSH_WEBHOOK_CI_RUN_*`)
 - Both channels share one validator: a declaration without `PATH`, an
   out-of-bounds value, or a declared `AUTH` name that is not set fails the
   plugin at boot (fail-closed, the config layer's posture)
-- A declared token env inside the `DSH_WEBHOOK_` namespace is a credential
-  value, not a declaration (no boot warning); any other mistyped
+- A declared token env produces no warning; any other mistyped
   `DSH_WEBHOOK_` variable warns at boot
 
 ## Tool
