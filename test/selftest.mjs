@@ -454,43 +454,45 @@ const promptCfg = {
   maxBodyBytes: 1024,
 }
 const RULES = 'Execution rules: see the "Trigger session" section of the dsh-webhook-dispatcher skill.'
-ok('prompt: delivery with content, no policy', () => {
+ok('prompt: delivery with content, no policy (static layer first)', () => {
   const text = buildPrompt(promptCfg, { contentType: 'application/json', bytes: 7, content: '{"a":1}' })
   assert.equal(
     text,
     [
       '<dsh-webhook-dispatcher> delivery from endpoint "GitHub" (/hooks/gh):',
+      '',
+      RULES,
+      '',
       'Content-Type: application/json',
       'Bytes: 7',
       '',
       '```',
       '{"a":1}',
       '```',
-      '',
-      RULES,
     ].join('\n'),
   )
 })
-ok('prompt: no-content delivery + policy block', () => {
+ok('prompt: no-content delivery + policy block (static layer first)', () => {
   const text = buildPrompt({ ...promptCfg, policy: 'act on it' }, { contentType: 'application/x-www-form-urlencoded', bytes: 0 })
   assert.equal(
     text,
     [
       '<dsh-webhook-dispatcher> delivery from endpoint "GitHub" (/hooks/gh):',
-      '(no content)',
       '',
       'Policy:',
       'act on it',
       '',
       RULES,
+      '',
+      '(no content)',
     ].join('\n'),
   )
 })
-ok('prompt: no-content GET, no policy', () => {
+ok('prompt: no-content GET, no policy (static layer first)', () => {
   const text = buildPrompt(promptCfg, null)
   assert.equal(
     text,
-    ['<dsh-webhook-dispatcher> delivery from endpoint "GitHub" (/hooks/gh):', '(no content)', '', RULES].join('\n'),
+    ['<dsh-webhook-dispatcher> delivery from endpoint "GitHub" (/hooks/gh):', '', RULES, '', '(no content)'].join('\n'),
   )
 })
 ok('prompt: an empty policy omits the block', () => {
@@ -504,17 +506,17 @@ ok('prompt: unknown content-type renders as "unknown"', () => {
 ok('prompt: the fence outgrows the longest backtick run in the content', () => {
   const content = 'a``b````c'
   const text = buildPrompt(promptCfg, { contentType: 'text/plain', bytes: content.length, content })
-  assert.match(text, /\n`````\na``b````c\n`````\n/)
+  assert.match(text, /\n`````\na``b````c\n`````$/)
 })
 ok('prompt: a three-tick content run forces a four-tick fence', () => {
   const content = 'x```y'
   const text = buildPrompt(promptCfg, { contentType: 'text/plain', bytes: content.length, content })
-  assert.match(text, /\n````\nx```y\n````\n/)
+  assert.match(text, /\n````\nx```y\n````$/)
 })
 ok('prompt: multi-line content survives verbatim under its fence', () => {
   const content = 'line1\n```\nline3'
   const text = buildPrompt(promptCfg, { contentType: 'text/plain', bytes: content.length, content })
-  assert.match(text, /\n````\nline1\n```\nline3\n````\n/)
+  assert.match(text, /\n````\nline1\n```\nline3\n````$/)
 })
 ok('prompt: no trailing newline', () => {
   assert.ok(!buildPrompt(promptCfg, null).endsWith('\n'))
@@ -712,7 +714,7 @@ await okA('dispatch: the spawn receives the prompt and the payload', async () =>
   const { prompt, content } = c.pending[0].req
   assert.equal(content.contentType, 'application/json')
   assert.equal(prompt.split('\n')[0], '<dsh-webhook-dispatcher> delivery from endpoint "GitHub" (/hooks/gh):')
-  assert.match(prompt, /\n```\n\{\}\n```\n/)
+  assert.match(prompt, /\n```\n\{\}\n```$/)
   c.settle(0, { ok: true, sessionId: 's1' })
   await tick2()
 })
@@ -868,7 +870,7 @@ await okA('202: a GET delivery carries no content in the prompt', async () => {
   handler(fakeReq({ method: 'GET' }).req, res)
   await tick2()
   assert.equal(res.status, 202)
-  assert.match(c.pending[0].req.prompt, /\n\(no content\)\n/)
+  assert.match(c.pending[0].req.prompt, /\(no content\)$/)
   c.settle(0, { ok: true, sessionId: 's1' })
   await tick2()
 })
@@ -882,7 +884,7 @@ await okA('202: a body-less POST is a no-content delivery, not an error', async 
   deliver()
   await tick2()
   assert.equal(res.status, 202)
-  assert.match(c.pending[0].req.prompt, /\n\(no content\)\n/)
+  assert.match(c.pending[0].req.prompt, /\(no content\)$/)
   c.settle(0, { ok: true, sessionId: 's1' })
   await tick2()
 })

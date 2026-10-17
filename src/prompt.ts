@@ -1,6 +1,13 @@
-// dsh-webhook-dispatcher: the trigger-session prompt template. Deterministic: a given (endpoint config, delivery content) yields
-// byte-identical output (test-asserted; the acceptance chain byte-matches the first
-// session message against it). The fence around the verbatim content is one
+// dsh-webhook-dispatcher: the trigger-session prompt template. Laid out
+// static-first per the shared layering convention of the sibling trigger
+// plugins: the label line (always line one: skill matching and
+// trigger-session self-identification depend on it), the Policy block
+// (omitted when the policy is empty) and the execution-rules pointer form
+// the static layer; the content metadata (Content-Type / Bytes) and the
+// fenced verbatim payload form the dynamic layer. Deterministic: a given
+// (endpoint config, delivery content) yields byte-identical output
+// (test-asserted; the acceptance chain byte-matches the first session
+// message against it). The fence around the verbatim content is one
 // backtick longer than the longest backtick run in the content (unbounded
 // rule: the fence always wins - the content can never break out of its
 // fence); the floor is three ticks (a one- or two-tick fence would also
@@ -46,6 +53,14 @@ export function hasContent(content: DeliveryContent | null): boolean {
 export function buildPrompt(config: EndpointConfig, content: DeliveryContent | null): string {
   const lines: string[] = []
   lines.push(`<dsh-webhook-dispatcher> delivery from endpoint "${config.name}" (${config.path}):`)
+  lines.push('')
+  if (config.policy !== '') {
+    lines.push('Policy:')
+    lines.push(config.policy)
+    lines.push('')
+  }
+  lines.push('Execution rules: see the "Trigger session" section of the dsh-webhook-dispatcher skill.')
+  lines.push('')
   if (content !== null && content.content !== undefined) {
     const text = content.content
     lines.push(`Content-Type: ${content.contentType || 'unknown'}`)
@@ -58,12 +73,5 @@ export function buildPrompt(config: EndpointConfig, content: DeliveryContent | n
   } else {
     lines.push('(no content)')
   }
-  if (config.policy !== '') {
-    lines.push('')
-    lines.push('Policy:')
-    lines.push(config.policy)
-  }
-  lines.push('')
-  lines.push('Execution rules: see the "Trigger session" section of the dsh-webhook-dispatcher skill.')
   return lines.join('\n')
 }
