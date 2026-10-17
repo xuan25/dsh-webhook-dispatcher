@@ -1,7 +1,7 @@
 // dsh-webhook-dispatcher configuration: the static Config schema (validated
 // by the cordis loader against the delivered config layer before the
-// constructor runs), the DSH_WEBHOOK_* env contract (the same endpoint shape
-// declared as DSH_WEBHOOK_<ENDPOINT_ID>_<FIELD> variables, read once at
+// constructor runs), the WEBHOOK_* env contract (the same endpoint shape
+// declared as WEBHOOK_<ENDPOINT_ID>_<FIELD> variables, read once at
 // boot), the channel folding (config layer > env > built-in defaults), and
 // the cross-endpoint validation no single-field schema can express (id/path
 // uniqueness across both channels, the framework route deny-list, the auth
@@ -131,9 +131,9 @@ export const ENDPOINT_DEFAULTS = {
 } as const
 
 // ---------------------------------------------------------------------------
-// The DSH_WEBHOOK_* env contract
+// The WEBHOOK_* env contract
 //
-// One endpoint is declared with DSH_WEBHOOK_<ENDPOINT_ID>_<FIELD> variables:
+// One endpoint is declared with WEBHOOK_<ENDPOINT_ID>_<FIELD> variables:
 // the id segment is the endpoint id uppercased with hyphens written as
 // underscores (the id charset carries no underscore, so the mapping is
 // one-to-one), the suffix is the config field in SCREAMING_SNAKE (the 1:1
@@ -151,7 +151,7 @@ export const ENDPOINT_DEFAULTS = {
 // failing any other check, rejects the plugin at boot.
 
 /** The env variable prefix of the contract. */
-export const ENV_PREFIX = 'DSH_WEBHOOK_'
+export const ENV_PREFIX = 'WEBHOOK_'
 
 /** Config-layer field -> the env suffix it maps onto (the 1:1 table). */
 export const CONFIG_FIELD_TO_ENV = {
@@ -210,11 +210,11 @@ function parseIntBounded(value: string, min: number, max: number): number | unde
 }
 
 /**
- * Discover the DSH_WEBHOOK_* endpoint declarations in the env record: a key
+ * Discover the WEBHOOK_* endpoint declarations in the env record: a key
  * is a declaration when a known field suffix matches at the tail and the
  * remaining segment is a valid endpoint id. The suffixes are tried longest
  * first, which makes the match deterministic for hyphenated ids
- * (DSH_WEBHOOK_CI_RUN_PATH = endpoint ci-run, field PATH; the one-word
+ * (WEBHOOK_CI_RUN_PATH = endpoint ci-run, field PATH; the one-word
  * suffixes can never be the tail of a multi-word field). A declared token
  * env (the AUTH value of any endpoint) is a credential value, not a
  * declaration: no warning for it. Any other declaration-like key (a
@@ -418,7 +418,7 @@ function buildEndpoints(raw: RawEndpoint[], env: Record<string, string | undefin
 
 /**
  * Fold the config channels into the effective config: built-in defaults <
- * the DSH_WEBHOOK_* env contract (read once at boot) < the delivered cordis
+ * the WEBHOOK_* env contract (read once at boot) < the delivered cordis
  * config layer (hot). The layer is materialized as synthetic env variables
  * written over a copy of the env record (a delivered value beats the env
  * value, which beats the built-in default; fields the layer omits resolve as
@@ -428,7 +428,7 @@ function buildEndpoints(raw: RawEndpoint[], env: Record<string, string | undefin
  * into one endpoint). The input env record is not mutated.
  * @param env the env record (process.env at boot; test-injectable).
  * @param delivered the loader-validated delivered config layer (may be undefined).
- * @param warn the boot-warning sink (unrecognized DSH_WEBHOOK_ variables).
+ * @param warn the boot-warning sink (unrecognized WEBHOOK_ variables).
  * @returns the effective config (defaults applied).
  * @throws on any cross-endpoint violation (the entry fails loudly).
  */

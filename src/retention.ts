@@ -5,7 +5,7 @@
 // 5000ms). A bare numeric string is ambiguous and rejected; anything else
 // (a third segment, an unknown unit, a separator, any stray character) is
 // invalid. The config channel (the endpoint's sessionRetention field and the
-// DSH_WEBHOOK_<ID>_SESSION_RETENTION env variable) carries the value as a
+// WEBHOOK_<ID>_SESSION_RETENTION env variable) carries the value as a
 // string; the number form is accepted by the shared parser as well.
 // An invalid value never fails the endpoint boot (the schema checks the type
 // only): the offload plane warns at sweep time and treats the window as 0
@@ -59,11 +59,11 @@ export function parseWindowMs(value: number | string): WindowParse {
   return typeof value === 'number' ? parseWindowNumber(value) : parseWindowString(value)
 }
 
-/** Per-sweep offload budget default (the DSH_WEBHOOK_OFFLOAD_BATCH knob default). */
+/** Per-sweep offload budget default (the WEBHOOK_OFFLOAD_BATCH knob default). */
 export const DEFAULT_OFFLOAD_BATCH = 50
 
 /**
- * Parse the DSH_WEBHOOK_OFFLOAD_BATCH env value (the per-sweep offload
+ * Parse the WEBHOOK_OFFLOAD_BATCH env value (the per-sweep offload
  * budget): a positive integer; absent: the default; invalid (non-integer,
  * zero, negative, non-numeric): a warning and the default (the component
  * stays on).
@@ -72,7 +72,7 @@ export function parseOffloadBatch(raw: string | undefined, warn: (m: string) => 
   if (raw === undefined) return DEFAULT_OFFLOAD_BATCH
   const n = Number(raw)
   if (!Number.isInteger(n) || n <= 0) {
-    warn(`DSH_WEBHOOK_OFFLOAD_BATCH=${raw} is not a positive integer; falling back to the default ${DEFAULT_OFFLOAD_BATCH}`)
+    warn(`WEBHOOK_OFFLOAD_BATCH=${raw} is not a positive integer; falling back to the default ${DEFAULT_OFFLOAD_BATCH}`)
     return DEFAULT_OFFLOAD_BATCH
   }
   return n

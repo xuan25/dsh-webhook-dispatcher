@@ -252,14 +252,14 @@ ok('the numeric caps are the schema bounds (1000 / 100000 / 10 MiB)', () => {
 })
 
 // ---------------------------------------------------------------- env contract
-// The DSH_WEBHOOK_* env channel (v2.4): the same endpoint shape declared as
-// DSH_WEBHOOK_<ENDPOINT_ID>_<FIELD> variables; precedence config layer >
+// The WEBHOOK_* env channel (v2.4): the same endpoint shape declared as
+// WEBHOOK_<ENDPOINT_ID>_<FIELD> variables; precedence config layer >
 // env > built-in defaults; fully fail-closed like the config layer.
-console.log('env contract (DSH_WEBHOOK_* channel)')
+console.log('env contract (WEBHOOK_* channel)')
 
 ok('env-only endpoint gets the built-in defaults', () => {
   const cfg = foldConfig(
-    { DSH_WEBHOOK_GH_PATH: '/hooks/gh', DSH_WEBHOOK_GH_POLICY: 'act on it' },
+    { WEBHOOK_GH_PATH: '/hooks/gh', WEBHOOK_GH_POLICY: 'act on it' },
     undefined,
     () => {},
   )
@@ -277,13 +277,13 @@ ok('env-only endpoint gets the built-in defaults', () => {
     },
   ])
 })
-ok('hyphenated id: DSH_WEBHOOK_CI_RUN_PATH declares endpoint ci-run', () => {
-  const cfg = foldConfig({ DSH_WEBHOOK_CI_RUN_PATH: '/ci/run' }, undefined, () => {})
+ok('hyphenated id: WEBHOOK_CI_RUN_PATH declares endpoint ci-run', () => {
+  const cfg = foldConfig({ WEBHOOK_CI_RUN_PATH: '/ci/run' }, undefined, () => {})
   assert.equal(cfg.endpoints[0].id, 'ci-run')
 })
 ok('per-field precedence: config layer beats env, env beats defaults', () => {
   const cfg = foldConfig(
-    { DSH_WEBHOOK_GH_PATH: '/env', DSH_WEBHOOK_GH_POLICY: 'env-policy', DSH_WEBHOOK_GH_MODEL: 'env/model' },
+    { WEBHOOK_GH_PATH: '/env', WEBHOOK_GH_POLICY: 'env-policy', WEBHOOK_GH_MODEL: 'env/model' },
     validate({ endpoints: [{ id: 'gh', path: '/cfg', model: 'cfg/model', maxConcurrent: 3 }] }),
     () => {},
   )
@@ -302,7 +302,7 @@ ok('per-field precedence: config layer beats env, env beats defaults', () => {
 })
 ok('two channels, two endpoints: the union of ids', () => {
   const cfg = foldConfig(
-    { DSH_WEBHOOK_BB_PATH: '/b' },
+    { WEBHOOK_BB_PATH: '/b' },
     validate({ endpoints: [{ id: 'aa', path: '/a' }] }),
     () => {},
   )
@@ -310,7 +310,7 @@ ok('two channels, two endpoints: the union of ids', () => {
 })
 ok('empty optional env values behave as absent', () => {
   const cfg = foldConfig(
-    { DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_SANDBOX: '', DSH_WEBHOOK_GH_MODEL: '', DSH_WEBHOOK_GH_REASONING_EFFORT: '' },
+    { WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_SANDBOX: '', WEBHOOK_GH_MODEL: '', WEBHOOK_GH_REASONING_EFFORT: '' },
     undefined,
     () => {},
   )
@@ -319,14 +319,14 @@ ok('empty optional env values behave as absent', () => {
   assert.equal('reasoningEffort' in cfg.endpoints[0], false)
 })
 throws('an env declaration without PATH rejects the boot', () =>
-  foldConfig({ DSH_WEBHOOK_GH_POLICY: 'x' }, undefined, () => {}),
+  foldConfig({ WEBHOOK_GH_POLICY: 'x' }, undefined, () => {}),
 )
-throws('an empty PATH env behaves as missing', () => foldConfig({ DSH_WEBHOOK_GH_PATH: '' }, undefined, () => {}))
-throws('an env path outside the route charset', () => foldConfig({ DSH_WEBHOOK_GH_PATH: '/GH' }, undefined, () => {}))
-throws('an env path on the framework deny-list', () => foldConfig({ DSH_WEBHOOK_GH_PATH: '/plugins' }, undefined, () => {}))
+throws('an empty PATH env behaves as missing', () => foldConfig({ WEBHOOK_GH_PATH: '' }, undefined, () => {}))
+throws('an env path outside the route charset', () => foldConfig({ WEBHOOK_GH_PATH: '/GH' }, undefined, () => {}))
+throws('an env path on the framework deny-list', () => foldConfig({ WEBHOOK_GH_PATH: '/plugins' }, undefined, () => {}))
 ok('an id present on both channels merges into one endpoint (config fields win, env-only fields survive)', () => {
   const cfg = foldConfig(
-    { DSH_WEBHOOK_GH_PATH: '/env', DSH_WEBHOOK_GH_MODEL: 'env/model' },
+    { WEBHOOK_GH_PATH: '/env', WEBHOOK_GH_MODEL: 'env/model' },
     validate({ endpoints: [{ id: 'gh', path: '/cfg' }] }),
     () => {},
   )
@@ -335,18 +335,18 @@ ok('an id present on both channels merges into one endpoint (config fields win, 
   assert.equal(cfg.endpoints[0].model, 'env/model')
 })
 throws('an env path colliding with a config-layer path', () =>
-  foldConfig({ DSH_WEBHOOK_LM_PATH: '/x' }, validate({ endpoints: [{ id: 'gh', path: '/x' }] }), () => {}),
+  foldConfig({ WEBHOOK_LM_PATH: '/x' }, validate({ endpoints: [{ id: 'gh', path: '/x' }] }), () => {}),
 )
 throws('an env sandbox outside the declared modes', () =>
-  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_SANDBOX: 'full' }, undefined, () => {}),
+  foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_SANDBOX: 'full' }, undefined, () => {}),
 )
 ok('a valid env reasoningEffort is carried', () => {
-  const cfg = foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_REASONING_EFFORT: 'off' }, undefined, () => {})
+  const cfg = foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_REASONING_EFFORT: 'off' }, undefined, () => {})
   assert.equal(cfg.endpoints[0].reasoningEffort, 'off')
 })
 ok('the env channel accepts every level of the closed set', () => {
   for (const level of REASONING_EFFORTS) {
-    const cfg = foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_REASONING_EFFORT: level }, undefined, () => {})
+    const cfg = foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_REASONING_EFFORT: level }, undefined, () => {})
     assert.equal(cfg.endpoints[0].reasoningEffort, level)
   }
 })
@@ -356,38 +356,38 @@ ok('the config channel accepts every level of the closed set', () => {
   }
 })
 throws('an env reasoningEffort outside the closed set', () =>
-  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_REASONING_EFFORT: 'banana' }, undefined, () => {}),
+  foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_REASONING_EFFORT: 'banana' }, undefined, () => {}),
 )
 throws('an env integer outside the shape (MAX_QUEUE=abc)', () =>
-  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_MAX_QUEUE: 'abc' }, undefined, () => {}),
+  foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_MAX_QUEUE: 'abc' }, undefined, () => {}),
 )
 throws('an env integer below the bound (MAX_CONCURRENT=0)', () =>
-  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_MAX_CONCURRENT: '0' }, undefined, () => {}),
+  foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_MAX_CONCURRENT: '0' }, undefined, () => {}),
 )
 throws('an env auth name that is not set rejects the boot (fail-closed)', () =>
-  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_AUTH: 'NO_SUCH_ENV' }, undefined, () => {}),
+  foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_AUTH: 'NO_SUCH_ENV' }, undefined, () => {}),
 )
 throws('an env auth name that is empty rejects the boot (fail-closed)', () =>
-  foldConfig({ GH_TOK: '', DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_AUTH: 'GH_TOK' }, undefined, () => {}),
+  foldConfig({ GH_TOK: '', WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_AUTH: 'GH_TOK' }, undefined, () => {}),
 )
 ok('an env auth name that is set: the NAME is carried, the value is not', () => {
   const cfg = foldConfig(
-    { GH_TOK: 'secret', DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_AUTH: 'GH_TOK' },
+    { GH_TOK: 'secret', WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_AUTH: 'GH_TOK' },
     undefined,
     () => {},
   )
   assert.equal(cfg.endpoints[0].auth, 'GH_TOK')
 })
 throws('an empty NAME env value is rejected (the config-layer posture)', () =>
-  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_NAME: '' }, undefined, () => {}),
+  foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_NAME: '' }, undefined, () => {}),
 )
 ok('a declared token env in the plugin namespace stays quiet', () => {
   const warnings = []
   foldConfig(
     {
-      DSH_WEBHOOK_GH_TOKEN: 'secret',
-      DSH_WEBHOOK_GH_PATH: '/g',
-      DSH_WEBHOOK_GH_AUTH: 'DSH_WEBHOOK_GH_TOKEN',
+      WEBHOOK_GH_TOKEN: 'secret',
+      WEBHOOK_GH_PATH: '/g',
+      WEBHOOK_GH_AUTH: 'WEBHOOK_GH_TOKEN',
     },
     undefined,
     (msg) => warnings.push(msg),
@@ -396,32 +396,32 @@ ok('a declared token env in the plugin namespace stays quiet', () => {
 })
 ok('a mistyped env field warns at boot', () => {
   const warnings = []
-  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_POLCI: 'x' }, undefined, (msg) => warnings.push(msg))
+  foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_POLCI: 'x' }, undefined, (msg) => warnings.push(msg))
   assert.equal(warnings.length, 1)
-  assert.match(warnings[0], /DSH_WEBHOOK_GH_POLCI/)
+  assert.match(warnings[0], /WEBHOOK_GH_POLCI/)
 })
-ok('a DSH_WEBHOOK_ key without an uppercase field suffix stays quiet', () => {
+ok('a WEBHOOK_ key without an uppercase field suffix stays quiet', () => {
   const warnings = []
-  foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_TOKEN2: 'x' }, undefined, (msg) => warnings.push(msg))
+  foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_TOKEN2: 'x' }, undefined, (msg) => warnings.push(msg))
   assert.deepEqual(warnings, [])
 })
 ok('the input env record is not mutated by the fold', () => {
-  const env = { DSH_WEBHOOK_GH_PATH: '/g' }
+  const env = { WEBHOOK_GH_PATH: '/g' }
   foldConfig(env, validate({ endpoints: [{ id: 'gh', model: 'm' }] }), () => {})
-  assert.deepEqual(env, { DSH_WEBHOOK_GH_PATH: '/g' })
+  assert.deepEqual(env, { WEBHOOK_GH_PATH: '/g' })
 })
 ok('zero env and zero config: zero endpoints (the no-op posture is unchanged)', () => {
   const cfg = foldConfig({}, undefined, () => {})
   assert.deepEqual(cfg.endpoints, [])
 })
-ok('the longest suffix wins: DSH_WEBHOOK_GH_MAX_QUEUE = endpoint gh, field MAX_QUEUE', () => {
-  const cfg = foldConfig({ DSH_WEBHOOK_GH_PATH: '/g', DSH_WEBHOOK_GH_MAX_QUEUE: '7' }, undefined, () => {})
+ok('the longest suffix wins: WEBHOOK_GH_MAX_QUEUE = endpoint gh, field MAX_QUEUE', () => {
+  const cfg = foldConfig({ WEBHOOK_GH_PATH: '/g', WEBHOOK_GH_MAX_QUEUE: '7' }, undefined, () => {})
   assert.equal(cfg.endpoints[0].id, 'gh')
   assert.equal(cfg.endpoints[0].maxQueue, 7)
 })
-ok('a hyphenated id plus a multi-word field: DSH_WEBHOOK_X_MAX_MAX_QUEUE = endpoint x-max, field MAX_QUEUE', () => {
+ok('a hyphenated id plus a multi-word field: WEBHOOK_X_MAX_MAX_QUEUE = endpoint x-max, field MAX_QUEUE', () => {
   const cfg = foldConfig(
-    { DSH_WEBHOOK_X_MAX_PATH: '/x', DSH_WEBHOOK_X_MAX_MAX_QUEUE: '5' },
+    { WEBHOOK_X_MAX_PATH: '/x', WEBHOOK_X_MAX_MAX_QUEUE: '5' },
     undefined,
     () => {},
   )
@@ -1804,9 +1804,9 @@ console.log('offload plane')
     }
   }
 
-  // -- knob: the offload batch knob (env DSH_WEBHOOK_OFFLOAD_BATCH: a positive
+  // -- knob: the offload batch knob (env WEBHOOK_OFFLOAD_BATCH: a positive
   //        integer, or the warn-and-keep degradation; the window itself is an
-  //        endpoint field / DSH_WEBHOOK_<ID>_SESSION_RETENTION, exercised in
+  //        endpoint field / WEBHOOK_<ID>_SESSION_RETENTION, exercised in
   //        the plugin-level lifecycle cases)
   {
     ok('knob-a: an absent knob falls back to the default', () =>
@@ -1817,7 +1817,7 @@ console.log('offload plane')
     const warns = []
     for (const v of ['0', '-2', 'abc', '5.5']) parseOffloadBatch(v, (m) => warns.push(m))
     ok('knob-b: each invalid knob value warns and falls back to the default', () => assert.equal(warns.length, 4))
-    ok('knob-b: the warning names the knob', () => assert.ok(warns.every((m) => m.includes('DSH_WEBHOOK_OFFLOAD_BATCH'))))
+    ok('knob-b: the warning names the knob', () => assert.ok(warns.every((m) => m.includes('WEBHOOK_OFFLOAD_BATCH'))))
   }
 
   // -- health: round health (the disabled branches: unreachable persistence

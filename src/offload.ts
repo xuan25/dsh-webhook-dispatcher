@@ -248,7 +248,7 @@ export interface OffloadSweeperOptions {
    * spawnSession adds at create resolution, settlement and dispose remove;
    * the sweep reads it as the liveness gate). */
   inflight: Set<string>
-  /** Per-sweep offload budget (the DSH_WEBHOOK_OFFLOAD_BATCH knob, default 50). */
+  /** Per-sweep offload budget (the WEBHOOK_OFFLOAD_BATCH knob, default 50). */
   cap: number
   /** Test seam: the clock (default Date.now). */
   now?: () => number

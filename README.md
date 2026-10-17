@@ -29,7 +29,7 @@ with the dsh plugin command:
 dsh plugin --profile <name> add dsh-webhook-dispatcher
 ```
 
-Configure endpoints through the `DSH_WEBHOOK_*` env block and/or the cordis
+Configure endpoints through the `WEBHOOK_*` env block and/or the cordis
 config layer (see Configuration).
 
 ## Cross-profile deployment
@@ -54,7 +54,7 @@ as `headless` cannot host a resident listener, so they cannot host this plugin:
 ## Configuration
 
 Endpoints are configured through two equal channels that fold onto one
-contract: the `DSH_WEBHOOK_*` env block (read once at process boot) and the
+contract: the `WEBHOOK_*` env block (read once at process boot) and the
 cordis config layer (the profile/user `cordis.patch.yml` entry targeting the
 plugin id `dsh-webhook-dispatcher`; hot - a patch change re-constructs the
 plugin entry, which re-reads both channels). Precedence per field: config
@@ -86,14 +86,14 @@ framework-owned route.
 
 ### Env contract
 
-The same endpoint shape as `DSH_WEBHOOK_<ENDPOINT_ID>_<FIELD>` variables:
+The same endpoint shape as `WEBHOOK_<ENDPOINT_ID>_<FIELD>` variables:
 
 ```sh
-DSH_WEBHOOK_<NAME>_PATH=/<path>
-DSH_WEBHOOK_<NAME>_POLICY="Treat the content as a task description and act on it."
-DSH_WEBHOOK_<NAME>_AUTH=<TOKEN_ENV>   # the NAME of the env holding the token value
-DSH_WEBHOOK_<NAME>_MODEL=some/model
-DSH_WEBHOOK_<NAME>_REASONING_EFFORT=low
+WEBHOOK_<NAME>_PATH=/<path>
+WEBHOOK_<NAME>_POLICY="Treat the content as a task description and act on it."
+WEBHOOK_<NAME>_AUTH=<TOKEN_ENV>   # the NAME of the env holding the token value
+WEBHOOK_<NAME>_MODEL=some/model
+WEBHOOK_<NAME>_REASONING_EFFORT=low
 <TOKEN_ENV>=...
 ```
 
@@ -113,12 +113,12 @@ DSH_WEBHOOK_<NAME>_REASONING_EFFORT=low
 | `sessionRetention` | `SESSION_RETENTION` | absent (retain in the store) |
 
 - The id segment is the endpoint id uppercased with hyphens written as
-  underscores (`ci-run` -> `DSH_WEBHOOK_CI_RUN_*`)
+  underscores (`ci-run` -> `WEBHOOK_CI_RUN_*`)
 - Both channels share one validator: a declaration without `PATH`, an
   out-of-bounds value, or a declared `AUTH` name that is not set fails the
   plugin at boot (fail-closed, the config layer's posture)
 - A declared token env produces no warning; any other mistyped
-  `DSH_WEBHOOK_` variable warns at boot
+  `WEBHOOK_` variable warns at boot
 
 ## Tool
 
@@ -137,12 +137,12 @@ running is kept until it settles.
 
 - **Windows**: `sessionRetention` is per-endpoint (the config layer's
   `sessionRetention` field or the env
-  `DSH_WEBHOOK_<ID>_SESSION_RETENTION`): a non-negative integer number of
+  `WEBHOOK_<ID>_SESSION_RETENTION`): a non-negative integer number of
   milliseconds, or a duration string of 1-2 digits+unit segments (units
   d/h/m/s/ms) in descending order (e.g. `24h`, `4h30m`, `90s`, `5000ms`;
   a bare numeric string is invalid). 0 / absent = retain (no offload); an
   invalid value warns and is treated as 0 (never a boot failure).
-- **Budget**: `DSH_WEBHOOK_OFFLOAD_BATCH` (env, default 50) bounds the
+- **Budget**: `WEBHOOK_OFFLOAD_BATCH` (env, default 50) bounds the
   sessions one sweep may process; an invalid value warns and falls back to
   50, never disabling the sweep. When consecutive sweeps observe new log
   lines arriving faster than the budget, the sweep logs a trend warning

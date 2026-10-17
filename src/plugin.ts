@@ -265,7 +265,7 @@ export class DshWebhookDispatcherPlugin extends Service {
         home: offloadLayout(resolveHome),
         units: () => units,
         inflight: this.offloadInflight,
-        cap: parseOffloadBatch(process.env.DSH_WEBHOOK_OFFLOAD_BATCH, (m) => this.log.warn(`${PLUGIN_NAME}: ${m}`)),
+        cap: parseOffloadBatch(process.env.WEBHOOK_OFFLOAD_BATCH, (m) => this.log.warn(`${PLUGIN_NAME}: ${m}`)),
       })
       this.sweeper.start()
     }
